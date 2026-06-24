@@ -1,0 +1,8 @@
+{
+  "project": "hermes-webui-dev",
+  "repo": "/home/sc/repos/hermes-webui-dev",
+  "current_task": "task002-fix-tiling-bugs",
+  "completed": [],
+  "created": "2026-06-24",
+  "note": "Dev branch for hermes-webui fork. Three workstreams: (1) fix tiling PR bugs, (2) project-specific new conversation buttons, (3) persistent voice mode."
+}
