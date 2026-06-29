@@ -6788,18 +6788,10 @@ html[data-conversation-outline="enabled"] #outlineToggleBtn:not([hidden]){displa
 .tile-send-btn{width:32px;height:32px;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;border:none;background:var(--accent);color:#fff;border-radius:8px;cursor:pointer;transition:background .15s;}
 .tile-send-btn:hover{background:var(--accent-hover);}
 
-.tile-bar{display:flex;align-items:center;gap:4px;padding:4px 8px;background:var(--sidebar);border-top:1px solid var(--border);overflow-x:auto;flex-shrink:0;min-height:34px;}
-.tile-bar--hidden{display:none;}
-.tile-tab{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--muted);font-size:11px;font-weight:500;cursor:pointer;white-space:nowrap;transition:background .15s,color .15s,border-color .15s;max-width:140px;overflow:hidden;text-overflow:ellipsis;}
-.tile-tab:hover{background:var(--hover-bg);color:var(--text);}
-.tile-tab--active{background:var(--accent-bg);color:var(--accent-text);border-color:var(--accent-bg-strong);}
-.tile-tab--minimized{opacity:0.7;}
-.tile-tab-dot{width:5px;height:5px;border-radius:999px;background:var(--accent);flex-shrink:0;}
-.tile-tab-dot[hidden]{display:none;}
-.tile-tab-close{font-size:14px;line-height:1;opacity:0.5;cursor:pointer;padding:0 2px;border-radius:3px;}
-.tile-tab-close:hover{opacity:1;background:var(--hover-bg);}
+/* Maximize: single tile takes over the grid, others hidden */
+.tile--maximized{border-radius:0;border:none;}
 
-body.tiling-mode .tile-grid{border-top:2px solid var(--accent);}
+body.tiling-mode .tile-grid{border-top:2px solid var(--accent);flex:1;}
 
 .session-tile-badge{display:inline-flex;align-items:center;justify-content:center;min-width:16px;height:16px;padding:0 4px;border-radius:999px;background:var(--accent);color:#fff;font-size:10px;font-weight:700;line-height:1;margin-left:4px;vertical-align:middle;}
 
@@ -6808,7 +6800,6 @@ body.tiling-mode .tile-grid{border-top:2px solid var(--accent);}
 body.tiling-mode .app-titlebar-tiling-btn{background:var(--accent-bg);color:var(--accent-text);}
 
 @media(max-width:700px){
-  .tile-grid:not(.tile-grid--empty){grid-template-columns:1fr !important;grid-template-rows:1fr !important;}
-  .tile:not(.tile--focused){display:none;}
-  .tile--focused{display:flex !important;}
+  .tile-grid:not(.tile-grid--empty){grid-template-columns:1fr !important;grid-template-rows:auto !important;}
+  .tile--maximized{grid-template-columns:1fr !important;grid-template-rows:1fr !important;}
 }

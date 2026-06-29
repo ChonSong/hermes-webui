@@ -1,17 +1,18 @@
 // ── Tiling chat interface ──────────────────────────────────────────────────
-// Managed by window.TILES. Each tile is a self-contained chat pane with its
-// own session, messages, composer, and stream state. Tiles can be arranged in
-// a CSS Grid, minimized to the tab bar, or closed.
+// Managed by window.TILES. Each tile is a self-contained chat pane. Tiles
+// are arranged in a CSS Grid that replaces #msgInner when tiling mode is on.
+// Maximize makes one tile fill the grid; unmaximize returns to grid view.
 
 (function(){
   const T = {
-    tiles: [],          // {id, sid, session, messages, busy, activeStreamId, minimized, el}
+    tiles: [],          // {id, sid, session, messages, busy, activeStreamId, maximized, el}
     activeTileId: null,
     maxTiles: 6,
     nextId: 1,
     gridEl: null,
-    tabBarEl: null,
     _tilingMode: false,
+    _msgInner: null,     // reference to original #msgInner element
+    _msgInnerParent: null,
   };
 
   function tileById(id) { return T.tiles.find(t => t.id === id) || null; }
@@ -31,11 +32,11 @@
           '<span class="tile-title"></span>' +
         '</div>' +
         '<div class="tile-header-actions">' +
-          '<button class="tile-btn tile-minimize-btn" data-tooltip="Minimize" aria-label="Minimize">' +
-            '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/></svg>' +
-          '</button>' +
-          '<button class="tile-btn tile-maximize-btn" data-tooltip="Focus" aria-label="Focus">' +
+          '<button class="tile-btn tile-maximize-btn" data-tooltip="Maximize" aria-label="Maximize">' +
             '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>' +
+          '</button>' +
+          '<button class="tile-btn tile-unmaximize-btn" data-tooltip="Restore" aria-label="Restore" hidden>' +
+            '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>' +
           '</button>' +
           '<button class="tile-btn tile-close-btn" data-tooltip="Close" aria-label="Close">' +
             '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>' +
@@ -59,8 +60,8 @@
       '</div>';
 
     // Wire controls
-    el.querySelector('.tile-minimize-btn').onclick = () => minimizeTile(tile.id);
-    el.querySelector('.tile-maximize-btn').onclick = () => focusTile(tile.id);
+    el.querySelector('.tile-maximize-btn').onclick = () => maximizeTile(tile.id);
+    el.querySelector('.tile-unmaximize-btn').onclick = () => unmaximizeTile(tile.id);
     el.querySelector('.tile-close-btn').onclick = () => closeTile(tile.id);
     el.querySelector('.tile-send-btn').onclick = () => _tileSend(tile.id);
     el.querySelector('.tile-input').addEventListener('keydown', e => {
@@ -79,23 +80,12 @@
     return el;
   }
 
-  function _createTabEl(tile) {
-    const el = document.createElement('button');
-    el.className = 'tile-tab';
-    el.dataset.tileId = String(tile.id);
-    el.innerHTML =
-      '<span class="tile-tab-dot" hidden></span>' +
-      '<span class="tile-tab-title"></span>' +
-      '<span class="tile-tab-close">&times;</span>';
-    el.querySelector('.tile-tab-title').onclick = () => restoreTile(tile.id);
-    el.querySelector('.tile-tab-close').onclick = e => { e.stopPropagation(); closeTile(tile.id); };
-    return el;
-  }
-
   // ── Render ───────────────────────────────────────────────────────────────
 
   function _renderTileMessages(tile) {
-    const shell = T.gridEl.querySelector(`.tile[data-tile-id="${tile.id}"] .tile-messages-shell`);
+    const el = tile.el || T.gridEl.querySelector(`.tile[data-tile-id="${tile.id}"]`);
+    if (!el) return;
+    const shell = el.querySelector('.tile-messages-shell');
     if (!shell) return;
     const empty = shell.querySelector('.tile-empty-state');
     const container = shell.querySelector('.tile-messages');
@@ -111,14 +101,14 @@
     if (empty) empty.hidden = true;
     container.hidden = false;
 
-    // Use _createMessageElement if available, otherwise simplified fallback
+    // Use _createMessageElement for consistent look with main chat
     const createMsg = window._createMessageElement;
     container.innerHTML = '';
     for (const msg of msgs) {
       if (!msg || !msg.role || msg.role === 'tool') continue;
       if (typeof createMsg === 'function') {
-        const el = createMsg(msg);
-        if (el) { el.classList.add('tile-msg'); container.appendChild(el); }
+        const msgEl = createMsg(msg);
+        if (msgEl) { msgEl.classList.add('tile-msg'); container.appendChild(msgEl); }
       } else {
         const d = document.createElement('div');
         d.className = 'tile-msg tile-msg--' + (msg.role === 'user' ? 'user' : 'assistant');
@@ -132,33 +122,24 @@
   }
 
   function _updateTileHeader(tile) {
-    const el = T.gridEl.querySelector(`.tile[data-tile-id="${tile.id}"]`);
+    const el = tile.el || T.gridEl.querySelector(`.tile[data-tile-id="${tile.id}"]`);
     if (!el) return;
     const title = tile.session ? (tile.session.title || 'New Chat') : 'No session';
     el.querySelector('.tile-title').textContent = title;
     el.querySelector('.tile-dot').hidden = !tile.busy;
-
-    const tab = T.tabBarEl.querySelector(`.tile-tab[data-tile-id="${tile.id}"]`);
-    if (tab) {
-      tab.querySelector('.tile-tab-title').textContent = title;
-      const d = tab.querySelector('.tile-tab-dot');
-      if (d) d.hidden = !tile.busy;
-    }
   }
 
   // ── Tile lifecycle ───────────────────────────────────────────────────────
 
   function openTileForSession(sid, sessionData) {
     if (!sid) return;
-    // Reuse existing tile for this session
     const existing = tileBySid(sid);
     if (existing) { focusTile(existing.id); return; }
 
-    // Enforce max — evict oldest idle (non-busy)
     if (T.tiles.length >= T.maxTiles) {
       const evict = T.tiles.find(t => !t.busy);
       if (evict) closeTile(evict.id);
-      else return; // all busy — refuse
+      else return;
     }
 
     const id = T.nextId++;
@@ -168,7 +149,7 @@
       messages: (sessionData && sessionData.messages) || [],
       busy: false,
       activeStreamId: null,
-      minimized: false,
+      maximized: false,
       el: null,
     };
     T.tiles.push(tile);
@@ -176,9 +157,6 @@
     const tileEl = _createTileEl(tile);
     tile.el = tileEl;
     T.gridEl.appendChild(tileEl);
-
-    const tabEl = _createTabEl(tile);
-    T.tabBarEl.appendChild(tabEl);
 
     _renderTileMessages(tile);
     _updateTileHeader(tile);
@@ -191,13 +169,9 @@
     const tile = tileById(id);
     if (!tile) return;
     T.activeTileId = id;
-    tile.minimized = false;
 
     for (const t of T.tiles) {
-      if (t.el) t.el.classList.toggle('tile--hidden', t.minimized);
       if (t.el) t.el.classList.toggle('tile--focused', t.id === id);
-      const tab = T.tabBarEl.querySelector(`.tile-tab[data-tile-id="${t.id}"]`);
-      if (tab) tab.classList.toggle('tile-tab--active', t.id === id && !t.minimized);
     }
 
     // Sync global S state so existing code reads from the active tile
@@ -216,40 +190,51 @@
     if (input) setTimeout(() => input.focus(), 50);
   }
 
-  function minimizeTile(id) {
+  function maximizeTile(id) {
     const tile = tileById(id);
     if (!tile) return;
-    tile.minimized = true;
-    if (tile.el) tile.el.classList.add('tile--hidden');
-    const tab = T.tabBarEl.querySelector(`.tile-tab[data-tile-id="${id}"]`);
-    if (tab) { tab.classList.remove('tile-tab--active'); tab.classList.add('tile-tab--minimized'); }
-
-    if (T.activeTileId === id) {
-      const next = T.tiles.find(t => !t.minimized);
-      if (next) focusTile(next.id);
-      else {
-        T.activeTileId = null;
-        if (typeof S !== 'undefined') { S.session = null; S.messages = []; S.busy = false; S.activeStreamId = null; }
-        if (typeof syncTopbar === 'function') syncTopbar();
+    // If another tile is maximized, unmaximize it first
+    const curMax = T.tiles.find(t => t.maximized);
+    if (curMax && curMax.id !== id) {
+      curMax.maximized = false;
+      if (curMax.el) {
+        curMax.el.classList.remove('tile--maximized');
+        curMax.el.querySelector('.tile-maximize-btn').hidden = false;
+        curMax.el.querySelector('.tile-unmaximize-btn').hidden = true;
       }
     }
-    _refreshGrid();
+    tile.maximized = true;
+    if (tile.el) {
+      tile.el.classList.add('tile--maximized');
+      tile.el.querySelector('.tile-maximize-btn').hidden = true;
+      tile.el.querySelector('.tile-unmaximize-btn').hidden = false;
+    }
+    // Hide non-maximized tiles
+    for (const t of T.tiles) {
+      if (t.el) t.el.classList.toggle('tile--hidden', !t.maximized);
+    }
   }
 
-  function restoreTile(id) {
+  function unmaximizeTile(id) {
     const tile = tileById(id);
     if (!tile) return;
-    tile.minimized = false;
-    if (tile.el) tile.el.classList.remove('tile--hidden');
-    const tab = T.tabBarEl.querySelector(`.tile-tab[data-tile-id="${id}"]`);
-    if (tab) tab.classList.remove('tile-tab--minimized');
-    focusTile(id);
+    tile.maximized = false;
+    if (tile.el) {
+      tile.el.classList.remove('tile--maximized');
+      tile.el.querySelector('.tile-maximize-btn').hidden = false;
+      tile.el.querySelector('.tile-unmaximize-btn').hidden = true;
+    }
+    // Show all tiles (none hidden by maximize)
+    for (const t of T.tiles) {
+      if (t.el) t.el.classList.remove('tile--hidden');
+    }
   }
 
   function closeTile(id) {
     const idx = T.tiles.findIndex(t => t.id === id);
     if (idx < 0) return;
     const tile = T.tiles[idx];
+
     // Cancel stream
     if (tile.busy && tile.activeStreamId && typeof cancelSessionStream === 'function') {
       cancelSessionStream(tile.session);
@@ -261,20 +246,16 @@
     }
     // Remove DOM
     if (tile.el) tile.el.remove();
-    const tab = T.tabBarEl.querySelector(`.tile-tab[data-tile-id="${id}"]`);
-    if (tab) tab.remove();
     T.tiles.splice(idx, 1);
 
     _updateSidebarBadge(tile.sid, -1);
 
     if (T.activeTileId === id) {
       T.activeTileId = null;
-      const next = T.tiles.find(t => !t.minimized);
+      const next = T.tiles[0]; // pick first remaining
       if (next) focusTile(next.id);
       else {
         if (typeof S !== 'undefined') { S.session = null; S.messages = []; S.busy = false; S.activeStreamId = null; }
-        const msgInner = document.getElementById('msgInner');
-        if (msgInner) msgInner.innerHTML = '';
         if (typeof syncTopbar === 'function') syncTopbar();
       }
     }
@@ -284,10 +265,8 @@
   // ── Grid layout ──────────────────────────────────────────────────────────
 
   function _refreshGrid() {
-    const visible = T.tiles.filter(t => !t.minimized);
-    const count = visible.length;
+    const count = T.tiles.length;
     T.gridEl.classList.toggle('tile-grid--empty', count === 0);
-    T.tabBarEl.classList.toggle('tile-bar--hidden', !T.tiles.some(t => t.minimized));
     if (count <= 1) {
       T.gridEl.style.gridTemplateColumns = '1fr';
       T.gridEl.style.gridTemplateRows = '1fr';
@@ -363,7 +342,6 @@
       }
 
       // Poll for stream completion — check tile's own state, not global S
-      // (which changes when user focuses a different tile)
       const poll = setInterval(async () => {
         try {
           const status = await fetch(`/api/session?session_id=${encodeURIComponent(tile.sid)}&messages=1&fields=busy,active_stream_id`).then(r => r.json());
@@ -413,12 +391,53 @@
     T._tilingMode = !T._tilingMode;
     document.body.classList.toggle('tiling-mode', T._tilingMode);
     try { localStorage.setItem('hermes-tiling-mode', T._tilingMode ? '1' : '0'); } catch(_) {}
+
+    // When tiling on: replace #msgInner with tile grid
+    if (T._tilingMode) {
+      _showTileGrid();
+    } else {
+      _hideTileGrid();
+    }
+
     if (typeof showToast === 'function') {
       showToast(T._tilingMode ? 'Tiling mode on — click sessions to open in new tiles' : 'Tiling mode off', 2500);
     }
-    // Sync the titlebar button active state
     const btn = document.getElementById('btnTilingMode');
     if (btn) btn.classList.toggle('active', T._tilingMode);
+  }
+
+  function _showTileGrid() {
+    T._msgInner = document.getElementById('msgInner');
+    if (!T._msgInner) return;
+    T._msgInnerParent = T._msgInner.parentNode;
+    if (!T._msgInnerParent) return;
+
+    // Hide the original messages and show tile grid in its place
+    T._msgInner.style.display = 'none';
+
+    // Create grid if not yet created
+    if (!T.gridEl) {
+      T.gridEl = document.createElement('div');
+      T.gridEl.id = 'tileGrid';
+      T.gridEl.className = 'tile-grid tile-grid--empty';
+      T._msgInnerParent.appendChild(T.gridEl);
+    }
+    T.gridEl.style.display = '';
+
+    // Hide the empty state since tile grid is now the content area
+    const emptyState = document.getElementById('emptyState');
+    if (emptyState) emptyState.style.display = 'none';
+  }
+
+  function _hideTileGrid() {
+    if (T.gridEl) T.gridEl.style.display = 'none';
+    if (T._msgInner) T._msgInner.style.display = '';
+
+    // Restore empty state if there are no messages in the main view
+    const emptyState = document.getElementById('emptyState');
+    if (emptyState && T._msgInner && !T._msgInner.children.length) {
+      emptyState.style.display = '';
+    }
   }
 
   function isTilingMode() { return !!T._tilingMode; }
@@ -426,20 +445,19 @@
   // ── Init ─────────────────────────────────────────────────────────────────
 
   function initTiles() {
+    // Create tile grid DOM early but hidden
     const mainChat = document.getElementById('mainChat');
     if (!mainChat) return;
 
-    const grid = document.createElement('div');
-    grid.id = 'tileGrid';
-    grid.className = 'tile-grid tile-grid--empty';
-    const tabBar = document.createElement('div');
-    tabBar.id = 'tileBar';
-    tabBar.className = 'tile-bar tile-bar--hidden';
-    mainChat.appendChild(grid);
-    mainChat.appendChild(tabBar);
-
-    T.gridEl = grid;
-    T.tabBarEl = tabBar;
+    // Create grid element adjacent to #msgInner, initially hidden
+    T.gridEl = document.createElement('div');
+    T.gridEl.id = 'tileGrid';
+    T.gridEl.className = 'tile-grid tile-grid--empty';
+    T.gridEl.style.display = 'none';
+    const msgInner = document.getElementById('msgInner');
+    if (msgInner && msgInner.parentNode) {
+      msgInner.parentNode.appendChild(T.gridEl);
+    }
 
     // Restore preference
     try {
@@ -456,8 +474,8 @@
   window.TILES = T;
   window.openTileForSession = openTileForSession;
   window.focusTile = focusTile;
-  window.minimizeTile = minimizeTile;
-  window.restoreTile = restoreTile;
+  window.maximizeTile = maximizeTile;
+  window.unmaximizeTile = unmaximizeTile;
   window.closeTile = closeTile;
   window.toggleTilingMode = toggleTilingMode;
   window.isTilingMode = isTilingMode;
