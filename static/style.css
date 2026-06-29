@@ -6784,9 +6784,10 @@ body.tiling-mode .tile-grid{display:flex;align-items:center;justify-content:cent
    The focused tile's container carries id="msgInner" so rendering targets it. */
 .tile-msg-inner{flex:1;min-height:0;overflow-y:auto;padding:0;
   scroll-behavior:smooth;display:flex;flex-direction:column;}
-/* When tiling mode is on, the original #msgInner is idled and must not compete
-   with the tile grid for flex space. */
-body.tiling-mode .messages-inner--idle{display:none !important;}
+/* When tiling mode is on, the original #msgInner (now .messages-inner--idle
+   sibling of the tile grid inside #messages) must not compete for flex space.
+   Target only direct children of #messages, not tile containers inside the grid. */
+body.tiling-mode #messages > .messages-inner--idle{display:none !important;}
 
 /* Maximize: single tile spans the entire grid, others hidden */
 .tile--maximized{border-radius:0;border:none;grid-column:1 / -1;grid-row:1 / -1;z-index:1;}
