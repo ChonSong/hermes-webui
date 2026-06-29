@@ -89,6 +89,27 @@
     el.querySelector('.tile-dot').hidden = !tile.busy;
   }
 
+  function _renderTileFromMessages(tile) {
+    const mi = document.getElementById('msgInner');
+    if (!mi) return;
+    mi.innerHTML = '';
+    const createMsg = window._createMessageElement;
+    const msgs = tile.messages || [];
+    for (const msg of msgs) {
+      if (!msg || !msg.role || msg.role === 'tool') continue;
+      if (typeof createMsg === 'function') {
+        const el = createMsg(msg);
+        if (el) mi.appendChild(el);
+      } else {
+        const d = document.createElement('div');
+        d.textContent = typeof msg.content === 'string' ? msg.content.slice(0, 500) : '(content)';
+        mi.appendChild(d);
+      }
+    }
+    if (mi.scrollTop !== undefined) mi.scrollTop = mi.scrollHeight;
+    tile._savedHtml = mi.innerHTML;
+  }
+
   // ── Tile lifecycle ───────────────────────────────────────────────────────
 
   function openTileForSession(sid, sessionData) {
@@ -147,7 +168,7 @@
             tile.session = full.session;
             if (T.activeTileId === id) {
               if (typeof S !== 'undefined') { S.messages = tile.messages; S.session = tile.session; }
-              if (typeof renderMessages === 'function') renderMessages();
+              _renderTileFromMessages(tile);
             }
           }
         } catch(_) {}
@@ -194,7 +215,6 @@
     if (newInner) {
       newInner.id = 'msgInner';
       newInner.className = 'tile-msg-inner messages-inner';
-      // Restore saved HTML if we have a snapshot, otherwise leave it
       if (tile._savedHtml) {
         newInner.innerHTML = tile._savedHtml;
       }
@@ -206,6 +226,11 @@
       S.messages = tile.messages || [];
       S.busy = tile.busy || false;
       S.activeStreamId = tile.activeStreamId || null;
+    }
+
+    // Render messages if we have data but no saved HTML snapshot
+    if (!tile._savedHtml && tile.messages && tile.messages.length > 0) {
+      _renderTileFromMessages(tile);
     }
 
     _restoreComposerFrom(tile);
