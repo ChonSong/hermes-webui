@@ -4889,6 +4889,9 @@ main.main > #mainPlugin{display:none;}
    state so it's still obviously selected. */
 .project-chip.no-project{border-style:dashed;}
 .project-chip .color-dot{width:6px;height:6px;border-radius:50%;display:inline-block;flex-shrink:0;}
+.project-chip .project-new-session-btn{display:none;margin-left:auto;background:none;border:none;cursor:pointer;font-size:12px;font-weight:700;line-height:1;padding:0 2px;color:var(--muted);opacity:.5;transition:opacity .15s;}
+.project-chip:hover .project-new-session-btn{display:inline-block;}
+.project-chip .project-new-session-btn:hover{opacity:1;color:var(--accent);}
 .project-create-btn{font-size:10px;padding:3px 6px;border-radius:12px;cursor:pointer;border:1px dashed var(--border2);background:none;color:var(--muted);opacity:.6;transition:all .15s;}
 .project-create-btn:hover{opacity:1;border-color:var(--blue);color:var(--blue);}
 .project-create-input{font-size:10px;padding:3px 8px;border-radius:12px;border:1px solid var(--accent-bg);background:var(--surface);color:var(--text);outline:none;min-width:40px;max-width:180px;width:auto;font-family:inherit;box-shadow:0 0 0 2px var(--accent-bg);}

@@ -6313,15 +6313,25 @@ function playNotificationSound(){
   if(!window._soundEnabled) return;
   try{
     const ctx=new (window.AudioContext||window.webkitAudioContext)();
-    const osc=ctx.createOscillator();
-    const gain=ctx.createGain();
-    osc.connect(gain);gain.connect(ctx.destination);
-    osc.type='sine';osc.frequency.setValueAtTime(660,ctx.currentTime);
-    osc.frequency.setValueAtTime(880,ctx.currentTime+0.1);
-    gain.gain.setValueAtTime(0.3,ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.01,ctx.currentTime+0.3);
-    osc.start(ctx.currentTime);osc.stop(ctx.currentTime+0.3);
-    osc.onended=()=>ctx.close();
+    const now=ctx.currentTime;
+    // Musical chime: C5→E5→G5 arpeggio with harmonics.
+    // Each note has a fundamental + octave harmonic for brightness.
+    function _tone(freq,start,dur,gain,type){
+      const o=ctx.createOscillator(),g=ctx.createGain();
+      o.type=type||'sine';o.frequency.setValueAtTime(freq,start);
+      g.gain.setValueAtTime(0,start);
+      g.gain.linearRampToValueAtTime(gain,start+0.008);
+      g.gain.exponentialRampToValueAtTime(0.001,start+dur);
+      o.connect(g);g.connect(ctx.destination);
+      o.start(start);o.stop(start+dur);
+    }
+    _tone(523.25,now,0.18,0.18);       // C5 fundamental
+    _tone(1046.5,now,0.18,0.07);       // C6 harmonic
+    _tone(659.25,now+0.10,0.18,0.18);  // E5
+    _tone(1318.5,now+0.10,0.18,0.06);  // E6 harmonic
+    _tone(783.99,now+0.20,0.22,0.18);  // G5
+    _tone(1568.0,now+0.20,0.22,0.05);  // G6 harmonic
+    setTimeout(()=>{try{ctx.close();}catch(_){}},600);
   }catch(e){console.warn('Notification sound failed:',e);}
 }
 
@@ -6365,7 +6375,7 @@ function playAttentionSound(key){
 function _notificationOptions(body,options={}){
   const sid=(options&&options.sid)||(S&&S.session&&S.session.session_id);
   const url=sid?`${location.origin}${_sessionUrlForSid(sid)}`:location.href;
-  return {body:body||'',tag:sid?`hermes-${sid}`:'hermes-webui',renotify:false,icon:'static/favicon-192.png',badge:'static/favicon-32.png',data:{url}};
+  return {body:body||'',tag:sid?`hermes-${sid}`:'hermes-webui',renotify:false,requireInteraction:true,icon:'static/favicon-192.png',badge:'static/favicon-32.png',data:{url}};
 }
 function _showPwaNotification(title,body,options={}){
   const botName=assistantDisplayName();
