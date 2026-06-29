@@ -229,8 +229,11 @@
   function maximizeTile(id) {
     const tile = tileById(id);
     if (!tile) return;
+    // Toggle: if already maximized, unmaximize
+    if (tile.maximized) { unmaximizeTile(id); return; }
+    // Unmaximize any currently maximized tile
     const curMax = T.tiles.find(t => t.maximized);
-    if (curMax && curMax.id !== id) {
+    if (curMax) {
       curMax.maximized = false;
       if (curMax.el) {
         curMax.el.classList.remove('tile--maximized');
@@ -238,12 +241,14 @@
         curMax.el.querySelector('.tile-unmaximize-btn').hidden = true;
       }
     }
+    // Maximize this tile
     tile.maximized = true;
     if (tile.el) {
       tile.el.classList.add('tile--maximized');
       tile.el.querySelector('.tile-maximize-btn').hidden = true;
       tile.el.querySelector('.tile-unmaximize-btn').hidden = false;
     }
+    // Hide all non-maximized tiles (exactly one tile is maximized)
     for (const t of T.tiles) {
       if (t.el) t.el.classList.toggle('tile--hidden', !t.maximized);
     }
@@ -285,6 +290,18 @@
     // Remove DOM
     if (tile.el) tile.el.remove();
     T.tiles.splice(idx, 1);
+
+    // If the closed tile was maximized, un-hide remaining tiles
+    if (tile.maximized) {
+      for (const t of T.tiles) {
+        t.maximized = false;
+        if (t.el) {
+          t.el.classList.remove('tile--hidden', 'tile--maximized');
+          t.el.querySelector('.tile-maximize-btn').hidden = false;
+          t.el.querySelector('.tile-unmaximize-btn').hidden = true;
+        }
+      }
+    }
 
     _updateSidebarBadge(tile.sid, -1);
 
