@@ -1,9 +1,8 @@
 // ── Tiling chat interface ──────────────────────────────────────────────────
-// Each tile owns a .tile-msg-inner that acts as its message container.
-// When a tile is focused, its container takes the id="msgInner" so the
-// existing messages.js rendering pipeline targets it natively.
-// All tiles keep their message content visible independently.
-// The main #composerWrap sends to the focused tile's session via S.session.
+// Each tile owns a .tile-msg-inner container. When a tile is focused,
+// its container gets id="msgInner" so all existing rendering targets it.
+// Content stays where it was rendered — no snapshotting needed.
+// Non-focused tiles keep their DOM content; just the id moves.
 
 (function(){
   const T = {
@@ -89,27 +88,6 @@
     el.querySelector('.tile-dot').hidden = !tile.busy;
   }
 
-  function _renderTileFromMessages(tile) {
-    const mi = document.getElementById('msgInner');
-    if (!mi) return;
-    mi.innerHTML = '';
-    const createMsg = window._createMessageElement;
-    const msgs = tile.messages || [];
-    for (const msg of msgs) {
-      if (!msg || !msg.role || msg.role === 'tool') continue;
-      if (typeof createMsg === 'function') {
-        const el = createMsg(msg);
-        if (el) mi.appendChild(el);
-      } else {
-        const d = document.createElement('div');
-        d.textContent = typeof msg.content === 'string' ? msg.content.slice(0, 500) : '(content)';
-        mi.appendChild(d);
-      }
-    }
-    if (mi.scrollTop !== undefined) mi.scrollTop = mi.scrollHeight;
-    tile._savedHtml = mi.innerHTML;
-  }
-
   // ── Tile lifecycle ───────────────────────────────────────────────────────
 
   function openTileForSession(sid, sessionData) {
@@ -135,7 +113,6 @@
       el: null,
       _composerText: '',
       _modelVal: null,
-      _savedHtml: '',       // snapshot of innerHTML when tile loses focus
     };
     T.tiles.push(tile);
 
@@ -143,7 +120,7 @@
     tile.el = tileEl;
     T.gridEl.appendChild(tileEl);
 
-    // Reset any stale maximize/hidden state
+    // Reset stale maximize/hidden state
     for (const t of T.tiles) {
       t.maximized = false;
       if (t.el) {
@@ -158,8 +135,11 @@
     _refreshGrid();
     focusTile(tile.id);
 
-    // If session data came without messages, load them async
-    if (!msgs.length && sid) {
+    // If messages came with session data OR loaded async, render them
+    if (msgs.length > 0) {
+      _renderMessagesToTile(tile);
+    } else if (sid) {
+      // Load messages async
       (async () => {
         try {
           const full = await api(`/api/session?session_id=${encodeURIComponent(sid)}&resolve_model=0`);
@@ -168,7 +148,7 @@
             tile.session = full.session;
             if (T.activeTileId === id) {
               if (typeof S !== 'undefined') { S.messages = tile.messages; S.session = tile.session; }
-              _renderTileFromMessages(tile);
+              _renderMessagesToTile(tile);
             }
           }
         } catch(_) {}
@@ -180,7 +160,7 @@
     const tile = tileById(id);
     if (!tile) return;
 
-    // Save old tile state: snapshot message HTML + save composer
+    // Save old tile S state + composer
     if (T.activeTileId && T.activeTileId !== id) {
       const oldTile = activeTile();
       if (oldTile) {
@@ -191,33 +171,29 @@
           oldTile.activeStreamId = S.activeStreamId || null;
           oldTile.session = S.session;
         }
-        // Snapshot the current #msgInner's content into the old tile
-        const curMsgInner = document.getElementById('msgInner');
-        if (curMsgInner) {
-          oldTile._savedHtml = curMsgInner.innerHTML;
-          curMsgInner.removeAttribute('id');
-        }
       }
+    }
+
+    // Move #msgInner id from old container to this tile's container.
+    // Content stays where rendered — we only move the id attribute.
+    // Tile containers keep their innerHTML: re-focusing restores the id
+    // and the existing pipeline picks up from S.messages.
+    const cur = document.getElementById('msgInner');
+    if (cur && cur !== tile.el.querySelector('.tile-msg-inner')) {
+      cur.removeAttribute('id');
     }
 
     T.activeTileId = id;
 
-    // Highlight
+    // Highlight focused tile
     for (const t of T.tiles) {
       if (t.el) t.el.classList.toggle('tile--focused', t.id === id);
-      // Restore tile's msg inner content by rewriting the class
-      const mi = t.el && t.el.querySelector('.tile-msg-inner');
-      if (mi) mi.className = t.id === id ? 'tile-msg-inner messages-inner' : 'tile-msg-inner messages-inner--idle';
     }
 
-    // Make this tile's container the #msgInner
+    // Set this tile's container as the render target
     const newInner = tile.el.querySelector('.tile-msg-inner');
     if (newInner) {
       newInner.id = 'msgInner';
-      newInner.className = 'tile-msg-inner messages-inner';
-      if (tile._savedHtml) {
-        newInner.innerHTML = tile._savedHtml;
-      }
     }
 
     // Sync global S
@@ -228,11 +204,6 @@
       S.activeStreamId = tile.activeStreamId || null;
     }
 
-    // Render messages if we have data but no saved HTML snapshot
-    if (!tile._savedHtml && tile.messages && tile.messages.length > 0) {
-      _renderTileFromMessages(tile);
-    }
-
     _restoreComposerFrom(tile);
 
     if (typeof syncTopbar === 'function') syncTopbar();
@@ -240,6 +211,30 @@
 
     _startBusyWatcher();
   }
+
+  // ── Render messages into the focused tile's container ────────────────────
+
+  function _renderMessagesToTile(tile) {
+    const mi = tile.el && tile.el.querySelector('.tile-msg-inner');
+    if (!mi) return;
+    mi.innerHTML = '';
+    const createMsg = window._createMessageElement;
+    const msgs = tile.messages || [];
+    for (const msg of msgs) {
+      if (!msg || !msg.role || msg.role === 'tool') continue;
+      if (typeof createMsg === 'function') {
+        const el = createMsg(msg);
+        if (el) mi.appendChild(el);
+      } else {
+        const d = document.createElement('div');
+        d.textContent = typeof msg.content === 'string' ? msg.content.slice(0, 500) : '(content)';
+        mi.appendChild(d);
+      }
+    }
+    if (mi.scrollTop !== undefined) mi.scrollTop = mi.scrollHeight;
+  }
+
+  // ── Maximize / Unmaximize ────────────────────────────────────────────────
 
   function maximizeTile(id) {
     const tile = tileById(id);
@@ -281,6 +276,8 @@
     _refreshGrid();
   }
 
+  // ── Close ────────────────────────────────────────────────────────────────
+
   function closeTile(id) {
     const idx = T.tiles.findIndex(t => t.id === id);
     if (idx < 0) return;
@@ -294,9 +291,8 @@
       if (typeof clearInflightState === 'function') clearInflightState(tile.sid);
     }
 
-    // Remove this tile's DOM (including its .tile-msg-inner)
+    // Remove DOM — if this tile had #msgInner, clear the id so it's not orphaned
     if (tile.el) {
-      // If this tile's container had the #msgInner id, clear it
       const mi = tile.el.querySelector('.tile-msg-inner');
       if (mi && mi.id === 'msgInner') mi.removeAttribute('id');
       tile.el.remove();
@@ -417,34 +413,29 @@
   }
 
   function _showTileGrid() {
-    // Move #msgInner id off the original element
     const origMsgInner = document.getElementById('msgInner');
     if (origMsgInner) {
       origMsgInner.removeAttribute('id');
       origMsgInner.classList.add('messages-inner--idle');
     }
-
-    // Show the tile grid
     T.gridEl.style.display = '';
   }
 
   function _hideTileGrid() {
     _stopBusyWatcher();
 
+    // Remove id from any tile container so the original can reclaim it
+    document.querySelectorAll('.tile-msg-inner[id="msgInner"]').forEach(el => el.removeAttribute('id'));
+
     // Restore #msgInner to the original element
-    const origMsgInner = document.querySelector('.messages-inner--idle');
+    const origMsgInner = document.querySelector('#messages > .messages-inner--idle');
     if (origMsgInner) {
       origMsgInner.id = 'msgInner';
       origMsgInner.classList.remove('messages-inner--idle');
     }
 
-    // Remove #msgInner from any tile's container
-    document.querySelectorAll('.tile-msg-inner[id="msgInner"]').forEach(el => el.removeAttribute('id'));
-
-    // Hide grid
     T.gridEl.style.display = 'none';
 
-    // Reset S
     if (typeof S !== 'undefined') {
       S.session = null;
       S.messages = [];
@@ -459,9 +450,6 @@
   // ── Init ─────────────────────────────────────────────────────────────────
 
   function initTiles() {
-    const mainChat = document.getElementById('mainChat');
-    if (!mainChat) return;
-
     T.gridEl = document.createElement('div');
     T.gridEl.id = 'tileGrid';
     T.gridEl.className = 'tile-grid tile-grid--empty';
@@ -472,7 +460,6 @@
       msgInner.parentNode.appendChild(T.gridEl);
     }
 
-    // Restore preference
     try {
       if (localStorage.getItem('hermes-tiling-mode') === '1') {
         setTimeout(() => { if (!isTilingMode()) toggleTilingMode(); }, 100);
