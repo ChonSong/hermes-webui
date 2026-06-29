@@ -70,12 +70,16 @@ def _status_counts_empty():
     }
 
 
-def test_extension_status_disabled_by_default():
+def test_extension_status_disabled_by_default(tmp_path, monkeypatch):
+    # With no HERMES_WEBUI_EXTENSION_DIR and no managed default dir yet, the
+    # gallery is "configured" (a managed install target is always available)
+    # but not yet valid/enabled until the first install creates the directory.
+    _use_extension_state_dir(monkeypatch, tmp_path)
     from api.extensions import get_extension_status
 
     assert get_extension_status() == {
         "enabled": False,
-        "extension_dir_configured": False,
+        "extension_dir_configured": True,
         "extension_dir_valid": False,
         "script_urls": [],
         "stylesheet_urls": [],
@@ -160,6 +164,8 @@ def test_extension_status_reports_loaded_manifest_counts_and_urls(tmp_path, monk
             "effective_enabled": True,
             "can_toggle": True,
             "reload_required": True,
+            "storage_owned": False,
+            "settings_schema": [],
             "status": "enabled",
         },
         {
@@ -171,6 +177,8 @@ def test_extension_status_reports_loaded_manifest_counts_and_urls(tmp_path, monk
             "effective_enabled": False,
             "can_toggle": False,
             "reload_required": True,
+            "storage_owned": False,
+            "settings_schema": [],
             "status": "manifest_disabled",
         },
     ]
@@ -184,6 +192,72 @@ def test_extension_status_reports_loaded_manifest_counts_and_urls(tmp_path, monk
         "sidecar_count": 0,
     }
     assert status["warnings"] == []
+
+
+def test_extension_status_sanitizes_settings_schema_only_for_owned_storage(tmp_path, monkeypatch):
+    root = tmp_path / "extensions"
+    root.mkdir()
+    (root / "extensions.json").write_text(
+        json.dumps(
+            {
+                "extensions": [
+                    {
+                        "id": "settings-ok",
+                        "permissions": {"storage": {"owned": True}},
+                        "settings_schema": [
+                            {"key": "flag", "type": "boolean", "label": "Flag", "default": True},
+                            {"key": "name", "type": "string", "default": "Ada"},
+                            {"key": "ratio", "type": "number", "default": 1.5},
+                            {"key": "count", "type": "integer", "default": 2},
+                            {
+                                "key": "mode",
+                                "type": "enum",
+                                "options": [
+                                    {"value": "compact", "label": "Compact"},
+                                    "full",
+                                ],
+                                "default": "compact",
+                            },
+                            {"key": "secret", "type": "string", "sensitive": True, "default": "x"},
+                            {"key": "badtype", "type": "object", "default": {}},
+                            {"key": "bad_enum", "type": "enum", "options": [{"label": "No value"}]},
+                            {"key": "flag", "type": "boolean", "default": False},
+                            {"key": "bad_default", "type": "integer", "default": 1.2},
+                            {"key": "null_flag", "type": "boolean", "default": None},
+                            {"key": "null_name", "type": "string", "default": None},
+                        ],
+                    },
+                    {
+                        "id": "settings-denied",
+                        "permissions": {"storage": {"owned": False}},
+                        "settings_schema": [{"key": "flag", "type": "boolean", "default": True}],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_WEBUI_EXTENSION_DIR", str(root))
+    monkeypatch.setenv("HERMES_WEBUI_EXTENSION_MANIFEST", "extensions.json")
+
+    from api.extensions import get_extension_config, get_extension_status
+
+    status = get_extension_status()
+    by_id = {entry["id"]: entry for entry in status["extensions"]}
+    assert by_id["settings-ok"]["storage_owned"] is True
+    assert [field["key"] for field in by_id["settings-ok"]["settings_schema"]] == ["flag", "name", "ratio", "count", "mode"]
+    assert by_id["settings-ok"]["settings_schema"][0]["default"] is True
+    assert by_id["settings-ok"]["settings_schema"][4]["options"] == [
+        {"value": "compact", "label": "Compact"},
+        {"value": "full", "label": "full"},
+    ]
+    assert by_id["settings-denied"]["storage_owned"] is False
+    assert by_id["settings-denied"]["settings_schema"] == []
+
+    config = get_extension_config()
+    config_by_id = {entry["id"]: entry for entry in config["extensions"]}
+    assert config_by_id["settings-ok"]["settings_schema"] == by_id["settings-ok"]["settings_schema"]
+    assert config_by_id["settings-denied"]["settings_schema"] == []
 
 
 def test_extension_status_ignores_non_dict_manifest_extensions_in_entry_count(
@@ -264,14 +338,17 @@ def test_extension_status_reports_unreadable_manifest_safely(tmp_path, monkeypat
     assert "bad-utf8.json" not in repr(status)
 
 
-def test_extension_status_reports_manifest_disabled_when_dir_unconfigured(monkeypatch):
+def test_extension_status_reports_manifest_disabled_when_dir_unconfigured(tmp_path, monkeypatch):
+    # No managed default dir exists yet, so even though the gallery target is
+    # "configured", a manifest env points at a directory that isn't valid yet.
+    _use_extension_state_dir(monkeypatch, tmp_path)
     monkeypatch.setenv("HERMES_WEBUI_EXTENSION_MANIFEST", "extensions.json")
 
     from api.extensions import get_extension_status
 
     status = get_extension_status()
     assert status["enabled"] is False
-    assert status["extension_dir_configured"] is False
+    assert status["extension_dir_configured"] is True
     assert status["extension_dir_valid"] is False
     assert status["manifest"]["status"] == "extension_disabled"
     assert status["manifest"]["configured"] is True

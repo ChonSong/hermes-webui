@@ -50,10 +50,15 @@ class FakeHandler:
         return None
 
 
-def test_extension_config_disabled_by_default(monkeypatch):
+def test_extension_config_disabled_by_default(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_WEBUI_EXTENSION_DIR", raising=False)
     monkeypatch.delenv("HERMES_WEBUI_EXTENSION_SCRIPT_URLS", raising=False)
     monkeypatch.delenv("HERMES_WEBUI_EXTENSION_STYLESHEET_URLS", raising=False)
+    # Point the managed state dir at an empty temp dir so the default extension
+    # root does not exist yet — config stays disabled until the first install.
+    import api.extensions as extensions
+
+    monkeypatch.setattr(extensions, "_extension_state_dir", lambda: tmp_path)
 
     from api.extensions import get_extension_config
 
@@ -119,6 +124,71 @@ def test_index_html_injection_escapes_urls_and_preserves_disabled_default(tmp_pa
     assert '<script src="/extensions/app.js?v=1&amp;mode=dev" defer></script>' in injected
     assert injected.index("/extensions/app.css") < injected.index("</head>")
     assert injected.index("/extensions/app.js") < injected.index("</body>")
+
+
+def test_extension_settings_runtime_config_injects_before_extension_scripts(tmp_path, monkeypatch):
+    root = tmp_path / "extensions"
+    root.mkdir()
+    (root / "manifest.json").write_text(
+        """
+        {
+          "extensions": [
+            {
+              "id": "settings-ok",
+              "scripts": ["settings-ok.js"],
+              "permissions": {"storage": {"owned": true}},
+              "settings_schema": [
+                {"key": "flag", "type": "boolean", "default": true}
+              ]
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_WEBUI_EXTENSION_DIR", str(root))
+    monkeypatch.setenv("HERMES_WEBUI_EXTENSION_MANIFEST", "manifest.json")
+
+    from api.extensions import inject_extension_tags
+
+    injected = inject_extension_tags("<html><head></head><body></body></html>")
+
+    assert "window.__HERMES_EXTENSION_CONFIG__" in injected
+    assert "window.HermesExtensionSettings.primeFromStatus(window.__HERMES_EXTENSION_CONFIG__)" in injected
+    assert '"storage_owned":true' in injected
+    assert '"settings_schema":[{"key":"flag","type":"boolean"' in injected
+    assert injected.index("window.__HERMES_EXTENSION_CONFIG__") < injected.index("/extensions/settings-ok.js")
+
+
+def test_extension_settings_only_manifest_still_injects_runtime_config(tmp_path, monkeypatch):
+    root = tmp_path / "extensions"
+    root.mkdir()
+    (root / "manifest.json").write_text(
+        """
+        {
+          "extensions": [
+            {
+              "id": "settings-only",
+              "permissions": {"storage": {"owned": true}},
+              "settings_schema": [
+                {"key": "flag", "type": "boolean", "default": true}
+              ]
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_WEBUI_EXTENSION_DIR", str(root))
+    monkeypatch.setenv("HERMES_WEBUI_EXTENSION_MANIFEST", "manifest.json")
+
+    from api.extensions import inject_extension_tags
+
+    injected = inject_extension_tags("<html><head></head><body></body></html>")
+
+    assert "window.__HERMES_EXTENSION_CONFIG__" in injected
+    assert '"id":"settings-only"' in injected
+    assert injected.index("window.__HERMES_EXTENSION_CONFIG__") < injected.index("</body>")
 
 
 def test_extension_route_remains_behind_webui_auth(monkeypatch):
@@ -192,6 +262,55 @@ def test_extension_manifest_adds_bundled_assets_before_env_urls(tmp_path, monkey
             "/extensions/base.css",
             "/extensions/templates/app.css",
             "/extensions/env-only.css",
+        ],
+        "extensions": [
+            {
+                "id": "templates",
+                "name": "templates",
+                "storage_owned": False,
+                "settings_schema": [],
+            },
+        ],
+    }
+
+
+def test_extension_manifest_relative_assets_resolve_from_manifest_directory(tmp_path, monkeypatch):
+    root = tmp_path / "extensions"
+    root.mkdir()
+    ext_dir = root / "desktop-companion"
+    ext_dir.mkdir()
+    (ext_dir / "manifest.json").write_text(
+        """
+        {
+          "extensions": [
+            {
+              "id": "desktop-companion",
+              "scripts": ["assets/companion-adapter.js"],
+              "stylesheets": ["assets/companion-adapter.css"]
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_WEBUI_EXTENSION_DIR", str(root))
+    monkeypatch.setenv("HERMES_WEBUI_EXTENSION_MANIFEST", "desktop-companion/manifest.json")
+    monkeypatch.delenv("HERMES_WEBUI_EXTENSION_SCRIPT_URLS", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_EXTENSION_STYLESHEET_URLS", raising=False)
+
+    from api.extensions import get_extension_config
+
+    assert get_extension_config() == {
+        "enabled": True,
+        "script_urls": ["/extensions/desktop-companion/assets/companion-adapter.js"],
+        "stylesheet_urls": ["/extensions/desktop-companion/assets/companion-adapter.css"],
+        "extensions": [
+            {
+                "id": "desktop-companion",
+                "name": "desktop-companion",
+                "storage_owned": False,
+                "settings_schema": [],
+            }
         ],
     }
 
@@ -499,6 +618,10 @@ def test_extension_manifest_accepts_top_level_extension_array(tmp_path, monkeypa
         "enabled": True,
         "script_urls": ["/extensions/a/a.js", "/extensions/b/b.js"],
         "stylesheet_urls": ["/extensions/a/a.css"],
+        "extensions": [
+            {"id": "a", "name": "a", "storage_owned": False, "settings_schema": []},
+            {"id": "b", "name": "b", "storage_owned": False, "settings_schema": []},
+        ],
     }
 
 def test_extension_static_serving_is_sandboxed(tmp_path, monkeypatch):
