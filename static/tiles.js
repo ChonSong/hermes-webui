@@ -149,10 +149,11 @@
     }
 
     const id = T.nextId++;
+    const msgs = (sessionData && sessionData.messages) || [];
     const tile = {
       id, sid,
       session: sessionData || null,
-      messages: (sessionData && sessionData.messages) || [],
+      messages: msgs,
       busy: false,
       activeStreamId: null,
       maximized: false,
@@ -166,10 +167,37 @@
     tile.el = tileEl;
     T.gridEl.appendChild(tileEl);
 
+    // Ensure no tiles are hidden from a previous maximize
+    for (const t of T.tiles) {
+      t.maximized = false;
+      if (t.el) {
+        t.el.classList.remove('tile--hidden', 'tile--maximized');
+        t.el.querySelector('.tile-maximize-btn').hidden = false;
+        t.el.querySelector('.tile-unmaximize-btn').hidden = true;
+      }
+    }
+
     _updateTileHeader(tile);
     _updateSidebarBadge(sid, 1);
     _refreshGrid();
     focusTile(tile.id);
+
+    // If session came with no messages, load them now
+    if (!msgs.length && sid) {
+      (async () => {
+        try {
+          const full = await api(`/api/session?session_id=${encodeURIComponent(sid)}&resolve_model=0`);
+          if (full && full.session && full.session.messages) {
+            tile.messages = full.session.messages;
+            tile.session = full.session;
+            if (T.activeTileId === id) {
+              if (typeof S !== 'undefined') { S.messages = tile.messages; S.session = tile.session; }
+              if (typeof renderMessages === 'function') renderMessages();
+            }
+          }
+        } catch(_) {}
+      })();
+    }
   }
 
   function focusTile(id) {

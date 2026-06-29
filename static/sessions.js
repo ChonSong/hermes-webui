@@ -1145,7 +1145,7 @@ async function loadSession(sid){
   if(typeof isTilingMode==='function' && isTilingMode()){
     if(typeof openTileForSession==='function'){
       try {
-        const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
+        const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&resolve_model=0`);
         openTileForSession(sid, data && data.session);
       } catch(e) {
         if(typeof showToast==='function') showToast('Failed to load session for tile', 3000, 'error');

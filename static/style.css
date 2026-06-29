@@ -6775,6 +6775,7 @@ body.tiling-mode .tile-grid{display:flex;align-items:center;justify-content:cent
 .tile-title{font-size:12px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px;}
 .tile-header-actions{display:flex;align-items:center;gap:2px;flex-shrink:0;}
 .tile-btn{width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;border:none;background:transparent;border-radius:5px;color:var(--muted);cursor:pointer;transition:background .15s,color .15s;}
+.tile-btn[hidden]{display:none !important;}
 .tile-btn:hover{background:var(--hover-bg);color:var(--text);}
 
 .tile-body{flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column;}
