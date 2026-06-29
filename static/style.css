@@ -6761,7 +6761,7 @@ html[data-conversation-outline="enabled"] #outlineToggleBtn:not([hidden]){displa
 
 /* ── Tiling chat interface ──────────────────────────────────────────────── */
 .tile-grid{display:none;flex:1;min-height:0;min-width:0;gap:4px;padding:4px;background:var(--bg);}
-.tile-grid:not(.tile-grid--empty){display:flex;}
+.tile-grid:not(.tile-grid--empty){display:grid;}
 
 .tile{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--bg);border:1px solid var(--border);border-radius:10px;overflow:hidden;}
 .tile--hidden{display:none !important;}

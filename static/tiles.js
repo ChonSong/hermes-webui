@@ -291,11 +291,17 @@
     if (count <= 1) {
       T.gridEl.style.gridTemplateColumns = '1fr';
       T.gridEl.style.gridTemplateRows = '1fr';
-    } else if (count === 2 || count === 4) {
+    } else if (count === 2) {
       T.gridEl.style.gridTemplateColumns = '1fr 1fr';
-      T.gridEl.style.gridTemplateRows = count > 2 ? '1fr 1fr' : '1fr';
+      T.gridEl.style.gridTemplateRows = '1fr';
+    } else if (count === 3) {
+      T.gridEl.style.gridTemplateColumns = '1fr 1fr 1fr';
+      T.gridEl.style.gridTemplateRows = '1fr';
+    } else if (count === 4) {
+      T.gridEl.style.gridTemplateColumns = '1fr 1fr';
+      T.gridEl.style.gridTemplateRows = '1fr 1fr';
     } else {
-      T.gridEl.style.gridTemplateColumns = '1fr 1fr';
+      T.gridEl.style.gridTemplateColumns = '1fr 1fr 1fr';
       T.gridEl.style.gridTemplateRows = '1fr 1fr';
     }
   }
@@ -350,22 +356,28 @@
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       tile.activeStreamId = data.stream_id || null;
+      if (tile.session) tile.session.active_stream_id = tile.activeStreamId;
       if (typeof S !== 'undefined') S.activeStreamId = tile.activeStreamId;
       if (typeof INFLIGHT !== 'undefined') {
         INFLIGHT[tile.sid] = { messages: [...tile.messages], uploaded: [], toolCalls: [] };
       }
 
-      // Poll for stream completion
-      const poll = setInterval(() => {
-        if (typeof S !== 'undefined' && S.session && S.session.session_id === tile.sid && !S.busy) {
-          clearInterval(poll);
-          tile.messages = [...S.messages];
-          tile.busy = false;
-          tile.activeStreamId = null;
-          _renderTileMessages(tile);
-          _updateTileHeader(tile);
-        }
-      }, 500);
+      // Poll for stream completion — check tile's own state, not global S
+      // (which changes when user focuses a different tile)
+      const poll = setInterval(async () => {
+        try {
+          const status = await fetch(`/api/session?session_id=${encodeURIComponent(tile.sid)}&messages=1&fields=busy,active_stream_id`).then(r => r.json());
+          const sess = status && status.session;
+          if (!sess || (!sess.busy && !sess.active_stream_id)) {
+            clearInterval(poll);
+            tile.messages = (sess && sess.messages) || tile.messages;
+            tile.busy = false;
+            tile.activeStreamId = null;
+            _renderTileMessages(tile);
+            _updateTileHeader(tile);
+          }
+        } catch(_) { /* retry on next tick */ }
+      }, 1000);
     } catch(e) {
       tile.busy = false;
       _updateTileHeader(tile);

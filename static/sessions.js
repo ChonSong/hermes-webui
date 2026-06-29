@@ -1144,8 +1144,12 @@ async function loadSession(sid){
   // Tiling mode: open session in a new tile instead of replacing
   if(typeof isTilingMode==='function' && isTilingMode()){
     if(typeof openTileForSession==='function'){
-      const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
-      openTileForSession(sid, data && data.session);
+      try {
+        const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
+        openTileForSession(sid, data && data.session);
+      } catch(e) {
+        if(typeof showToast==='function') showToast('Failed to load session for tile', 3000, 'error');
+      }
       return;
     }
   }
