@@ -263,6 +263,7 @@
     for (const t of T.tiles) {
       if (t.el) t.el.classList.toggle('tile--hidden', !t.maximized);
     }
+    _refreshGrid();
   }
 
   function unmaximizeTile(id) {
@@ -277,6 +278,7 @@
     for (const t of T.tiles) {
       if (t.el) t.el.classList.remove('tile--hidden');
     }
+    _refreshGrid();
   }
 
   function closeTile(id) {
@@ -331,17 +333,19 @@
 
   function _refreshGrid() {
     const count = T.tiles.length;
+    const visible = T.tiles.filter(t => !t.maximized || t === activeTile());
+    const visCount = visible.length;
     T.gridEl.classList.toggle('tile-grid--empty', count === 0);
-    if (count <= 1) {
+    if (visCount <= 1) {
       T.gridEl.style.gridTemplateColumns = '1fr';
       T.gridEl.style.gridTemplateRows = '1fr';
-    } else if (count === 2) {
+    } else if (visCount === 2) {
       T.gridEl.style.gridTemplateColumns = '1fr 1fr';
       T.gridEl.style.gridTemplateRows = '1fr';
-    } else if (count === 3) {
+    } else if (visCount === 3) {
       T.gridEl.style.gridTemplateColumns = '1fr 1fr 1fr';
       T.gridEl.style.gridTemplateRows = '1fr';
-    } else if (count === 4) {
+    } else if (visCount === 4) {
       T.gridEl.style.gridTemplateColumns = '1fr 1fr';
       T.gridEl.style.gridTemplateRows = '1fr 1fr';
     } else {
