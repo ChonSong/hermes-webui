@@ -934,7 +934,8 @@ async function newSession(flash, options={}){
     };
     if(S.session&&S.session.session_id) reqBody.prev_session_id=S.session.session_id;
     if(options&&options.worktree) reqBody.worktree=true;
-    if(_activeProject&&_activeProject!==NO_PROJECT_FILTER) reqBody.project_id=_activeProject;
+    if(options&&options.project_id) reqBody.project_id=options.project_id;
+    else if(_activeProject&&_activeProject!==NO_PROJECT_FILTER) reqBody.project_id=_activeProject;
     // Forward a pre-session toolset override only from the empty composer (#4490).
     if(!S.session && Array.isArray(S._pendingSessionToolsets)) reqBody.enabled_toolsets=S._pendingSessionToolsets;
     const modelSelForNew=$('modelSelect');
@@ -6182,6 +6183,16 @@ function renderSessionListFromCache(){
       const nameSpan=document.createElement('span');
       nameSpan.textContent=p.name;
       chip.appendChild(nameSpan);
+      const nsBtn=document.createElement('button');
+      nsBtn.className='project-new-session-btn';
+      nsBtn.textContent='+';
+      nsBtn.title='New session in '+p.name;
+      nsBtn.onclick=(e)=>{
+        e.stopPropagation();e.preventDefault();
+        if(_pClickTimer){clearTimeout(_pClickTimer);_pClickTimer=null;}
+        newSession(false,{project_id:p.project_id});
+      };
+      chip.appendChild(nsBtn);
       let _pClickTimer=null;
       chip.onclick=(e)=>{
         clearTimeout(_pClickTimer);
