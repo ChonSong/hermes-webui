@@ -6777,16 +6777,7 @@ html[data-conversation-outline="enabled"] #outlineToggleBtn:not([hidden]){displa
 .tile-btn:hover{background:var(--hover-bg);color:var(--text);}
 
 .tile-body{flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column;}
-.tile-messages-shell{flex:1;min-height:0;overflow-y:auto;padding:8px 12px;scroll-behavior:smooth;}
-.tile-empty-state{display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:13px;}
-
-.tile-composer{flex-shrink:0;border-top:1px solid var(--border);background:var(--sidebar);padding:6px 8px;}
-.tile-composer-status{font-size:10px;color:var(--muted);min-height:14px;padding:0 2px 2px;}
-.tile-composer-row{display:flex;align-items:flex-end;gap:6px;}
-.tile-input{flex:1;min-height:32px;max-height:120px;resize:none;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:7px 10px;font-size:13px;line-height:1.4;font-family:var(--font-ui);outline:none;transition:border-color .15s;}
-.tile-input:focus{border-color:var(--accent);box-shadow:0 0 0 2px var(--focus-ring);}
-.tile-send-btn{width:32px;height:32px;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;border:none;background:var(--accent);color:#fff;border-radius:8px;cursor:pointer;transition:background .15s;}
-.tile-send-btn:hover{background:var(--accent-hover);}
+.tile-body-placeholder{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:13px;}
 
 /* Maximize: single tile takes over the grid, others hidden */
 .tile--maximized{border-radius:0;border:none;}

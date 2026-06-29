@@ -1,23 +1,77 @@
 // ── Tiling chat interface ──────────────────────────────────────────────────
-// Managed by window.TILES. Each tile is a self-contained chat pane. Tiles
-// are arranged in a CSS Grid that replaces #msgInner when tiling mode is on.
+// Managed by window.TILES. When tiling mode is on, #msgInner is moved into
+// the focused tile's body so all existing message rendering targets the tile.
+// The main #composerWrap sends to the focused tile's session via S.session.
 // Maximize makes one tile fill the grid; unmaximize returns to grid view.
 
 (function(){
   const T = {
-    tiles: [],          // {id, sid, session, messages, busy, activeStreamId, maximized, el}
+    tiles: [],          // {id, sid, session, messages, busy, activeStreamId, maximized, el,
+                        //  composerText, modelState}  -- saved per tile
     activeTileId: null,
     maxTiles: 6,
     nextId: 1,
     gridEl: null,
     _tilingMode: false,
-    _msgInner: null,     // reference to original #msgInner element
-    _msgInnerParent: null,
+    _msgInner: null,
+    _msgInnerOriginalParent: null,
+    _msgInnerOriginalNextSibling: null,
+    _busyWatcher: null,
   };
 
   function tileById(id) { return T.tiles.find(t => t.id === id) || null; }
   function tileBySid(sid) { return T.tiles.find(t => t.sid === sid) || null; }
   function activeTile() { return tileById(T.activeTileId); }
+
+  // ── Composer state helpers ──────────────────────────────────────────────
+
+  function _readComposerState() {
+    const msg = document.getElementById('msg');
+    const modelSel = document.getElementById('modelSelect');
+    return {
+      text: msg ? msg.value : '',
+      model: modelSel ? modelSel.value : (window._defaultModel || ''),
+      modelProvider: (typeof _readActiveModelProvider === 'function') ? _readActiveModelProvider() : null,
+    };
+  }
+
+  function _writeComposerState(state) {
+    if (!state) return;
+    const msg = document.getElementById('msg');
+    if (msg) msg.value = state.text || '';
+    if (typeof triggerMsgh === 'function') triggerMsgh();
+    // Model state restore
+    if (state.model && document.getElementById('modelSelect')) {
+      const sel = document.getElementById('modelSelect');
+      if (sel && state.model !== sel.value) {
+        sel.value = state.model;
+        if (typeof _onModelSelectChange === 'function') _onModelSelectChange();
+      }
+    }
+  }
+
+  function _saveActiveTileComposerState() {
+    const tile = activeTile();
+    if (!tile) return;
+    tile.composerText = _readComposerState().text;
+    // Also save current model state
+    const modelSel = document.getElementById('modelSelect');
+    if (modelSel) tile._model = modelSel.value;
+  }
+
+  function _restoreTileComposerState(tile) {
+    if (!tile) return;
+    const msg = document.getElementById('msg');
+    if (msg) msg.value = tile.composerText || '';
+    if (typeof triggerMsgh === 'function') triggerMsgh();
+    if (tile._model && document.getElementById('modelSelect')) {
+      const sel = document.getElementById('modelSelect');
+      if (sel && tile._model !== sel.value) {
+        sel.value = tile._model;
+        if (typeof _onModelSelectChange === 'function') _onModelSelectChange();
+      }
+    }
+  }
 
   // ── DOM helpers ──────────────────────────────────────────────────────────
 
@@ -44,35 +98,15 @@
         '</div>' +
       '</div>' +
       '<div class="tile-body">' +
-        '<div class="tile-messages-shell">' +
-          '<div class="tile-empty-state">What can I help with?</div>' +
-          '<div class="tile-messages" hidden></div>' +
-        '</div>' +
-      '</div>' +
-      '<div class="tile-composer">' +
-        '<div class="tile-composer-status"></div>' +
-        '<div class="tile-composer-row">' +
-          '<textarea class="tile-input" placeholder="Message …" rows="1"></textarea>' +
-          '<button class="tile-send-btn" aria-label="Send">' +
-            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>' +
-          '</button>' +
-        '</div>' +
+        '<div class="tile-body-placeholder"></div>' +
       '</div>';
 
     // Wire controls
     el.querySelector('.tile-maximize-btn').onclick = () => maximizeTile(tile.id);
     el.querySelector('.tile-unmaximize-btn').onclick = () => unmaximizeTile(tile.id);
     el.querySelector('.tile-close-btn').onclick = () => closeTile(tile.id);
-    el.querySelector('.tile-send-btn').onclick = () => _tileSend(tile.id);
-    el.querySelector('.tile-input').addEventListener('keydown', e => {
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); _tileSend(tile.id); }
-    });
-    el.querySelector('.tile-input').addEventListener('input', function() {
-      this.style.height = 'auto';
-      this.style.height = Math.min(this.scrollHeight, 120) + 'px';
-    });
     // Click body or header to focus
-    el.querySelector('.tile-body').onclick = () => focusTile(tile.id);
+    el.querySelector('.tile-body').addEventListener('click', () => focusTile(tile.id));
     el.querySelector('.tile-header').addEventListener('click', e => {
       if (!e.target.closest('.tile-btn')) focusTile(tile.id);
     });
@@ -83,42 +117,14 @@
   // ── Render ───────────────────────────────────────────────────────────────
 
   function _renderTileMessages(tile) {
-    const el = tile.el || T.gridEl.querySelector(`.tile[data-tile-id="${tile.id}"]`);
-    if (!el) return;
-    const shell = el.querySelector('.tile-messages-shell');
-    if (!shell) return;
-    const empty = shell.querySelector('.tile-empty-state');
-    const container = shell.querySelector('.tile-messages');
-    if (!container) return;
-
-    const msgs = tile.messages || [];
-    if (!msgs.length) {
-      if (empty) empty.hidden = false;
-      container.innerHTML = '';
-      container.hidden = true;
-      return;
-    }
-    if (empty) empty.hidden = true;
-    container.hidden = false;
-
-    // Use _createMessageElement for consistent look with main chat
-    const createMsg = window._createMessageElement;
-    container.innerHTML = '';
-    for (const msg of msgs) {
-      if (!msg || !msg.role || msg.role === 'tool') continue;
-      if (typeof createMsg === 'function') {
-        const msgEl = createMsg(msg);
-        if (msgEl) { msgEl.classList.add('tile-msg'); container.appendChild(msgEl); }
-      } else {
-        const d = document.createElement('div');
-        d.className = 'tile-msg tile-msg--' + (msg.role === 'user' ? 'user' : 'assistant');
-        d.textContent = typeof msg.content === 'string' ? msg.content.slice(0, 500) : '(content)';
-        container.appendChild(d);
-      }
-    }
-
-    // Auto-scroll to bottom
-    shell.scrollTop = shell.scrollHeight;
+    // When a tile is focused and #msgInner is inside it, the existing
+    // message rendering pipeline handles display. This function is called
+    // when the tile is NOT focused (to show a preview) or after stream
+    // completion. Since #msgInner renders messages via the main pipeline,
+    // we just need to ensure the tile's S state is synced.
+    // The main message area (#msgInner) handles rendering via messages.js.
+    // Update the header dot for busy state.
+    _updateTileHeader(tile);
   }
 
   function _updateTileHeader(tile) {
@@ -151,6 +157,8 @@
       activeStreamId: null,
       maximized: false,
       el: null,
+      composerText: '',
+      _model: null,
     };
     T.tiles.push(tile);
 
@@ -158,7 +166,6 @@
     tile.el = tileEl;
     T.gridEl.appendChild(tileEl);
 
-    _renderTileMessages(tile);
     _updateTileHeader(tile);
     _updateSidebarBadge(sid, 1);
     _refreshGrid();
@@ -168,32 +175,60 @@
   function focusTile(id) {
     const tile = tileById(id);
     if (!tile) return;
+
+    // Save current tile state before switching
+    _saveActiveTileComposerState();
+    if (T.activeTileId && T.activeTileId !== id) {
+      const oldTile = activeTile();
+      if (oldTile && typeof S !== 'undefined') {
+        oldTile.messages = [...(S.messages || [])];
+        oldTile.busy = !!S.busy;
+        oldTile.activeStreamId = S.activeStreamId || null;
+        oldTile.session = S.session;
+      }
+      // Move #msgInner out of old tile
+      if (T._msgInner && oldTile && oldTile.el) {
+        const placeholder = oldTile.el.querySelector('.tile-body-placeholder');
+        if (placeholder) placeholder.parentNode.insertBefore(T._msgInner, placeholder.nextSibling || placeholder);
+        // Actually, move msgInner back to grid (the safe place)
+        if (T.gridEl) T.gridEl.appendChild(T._msgInner);
+      }
+    }
+
     T.activeTileId = id;
 
+    // Highlight
     for (const t of T.tiles) {
       if (t.el) t.el.classList.toggle('tile--focused', t.id === id);
     }
 
-    // Sync global S state so existing code reads from the active tile
-    if (tile.session) {
-      if (typeof S !== 'undefined') {
-        S.session = tile.session;
-        S.messages = tile.messages;
-        S.busy = tile.busy;
-        S.activeStreamId = tile.activeStreamId;
-      }
+    // Move #msgInner into this tile's body
+    if (T._msgInner && tile.el) {
+      const body = tile.el.querySelector('.tile-body');
+      if (body) body.appendChild(T._msgInner);
     }
+
+    // Sync global S state
+    if (typeof S !== 'undefined') {
+      S.session = tile.session;
+      S.messages = tile.messages || [];
+      S.busy = tile.busy || false;
+      S.activeStreamId = tile.activeStreamId || null;
+    }
+
+    // Restore this tile's composer state
+    _restoreTileComposerState(tile);
+
     if (typeof syncTopbar === 'function') syncTopbar();
     if (typeof syncModelChip === 'function') syncModelChip();
 
-    const input = tile.el.querySelector('.tile-input');
-    if (input) setTimeout(() => input.focus(), 50);
+    // Start busy watcher for this tile
+    _startBusyWatcher();
   }
 
   function maximizeTile(id) {
     const tile = tileById(id);
     if (!tile) return;
-    // If another tile is maximized, unmaximize it first
     const curMax = T.tiles.find(t => t.maximized);
     if (curMax && curMax.id !== id) {
       curMax.maximized = false;
@@ -209,7 +244,6 @@
       tile.el.querySelector('.tile-maximize-btn').hidden = true;
       tile.el.querySelector('.tile-unmaximize-btn').hidden = false;
     }
-    // Hide non-maximized tiles
     for (const t of T.tiles) {
       if (t.el) t.el.classList.toggle('tile--hidden', !t.maximized);
     }
@@ -224,7 +258,6 @@
       tile.el.querySelector('.tile-maximize-btn').hidden = false;
       tile.el.querySelector('.tile-unmaximize-btn').hidden = true;
     }
-    // Show all tiles (none hidden by maximize)
     for (const t of T.tiles) {
       if (t.el) t.el.classList.remove('tile--hidden');
     }
@@ -239,11 +272,16 @@
     if (tile.busy && tile.activeStreamId && typeof cancelSessionStream === 'function') {
       cancelSessionStream(tile.session);
     }
-    // Cleanup INFLIGHT
     if (tile.sid && typeof INFLIGHT !== 'undefined' && INFLIGHT[tile.sid]) {
       delete INFLIGHT[tile.sid];
       if (typeof clearInflightState === 'function') clearInflightState(tile.sid);
     }
+
+    // If this is the focused tile, move #msgInner out first
+    if (T.activeTileId === id && T._msgInner) {
+      if (T.gridEl) T.gridEl.appendChild(T._msgInner);
+    }
+
     // Remove DOM
     if (tile.el) tile.el.remove();
     T.tiles.splice(idx, 1);
@@ -252,11 +290,12 @@
 
     if (T.activeTileId === id) {
       T.activeTileId = null;
-      const next = T.tiles[0]; // pick first remaining
+      const next = T.tiles[0];
       if (next) focusTile(next.id);
       else {
         if (typeof S !== 'undefined') { S.session = null; S.messages = []; S.busy = false; S.activeStreamId = null; }
         if (typeof syncTopbar === 'function') syncTopbar();
+        _stopBusyWatcher();
       }
     }
     _refreshGrid();
@@ -285,82 +324,33 @@
     }
   }
 
-  // ── Tile send ────────────────────────────────────────────────────────────
+  // ── Busy watcher ────────────────────────────────────────────────────────
 
-  async function _tileSend(tileId) {
-    const tile = tileById(tileId);
-    if (!tile) return;
-    const input = tile.el.querySelector('.tile-input');
-    const text = (input && input.value.trim()) || '';
-    if (!text) return;
-    if (input) { input.value = ''; input.style.height = 'auto'; }
+  function _startBusyWatcher() {
+    _stopBusyWatcher();
+    T._busyWatcher = setInterval(() => {
+      const tile = activeTile();
+      if (!tile || T.activeTileId === null) { _stopBusyWatcher(); return; }
+      if (typeof S === 'undefined') return;
 
-    // If tile has no session, create one
-    if (!tile.session) {
-      try {
-        const body = { model: window._defaultModel || '', model_provider: null, workspace: null, profile: 'default' };
-        const data = await api('/api/session/new', { method: 'POST', body: JSON.stringify(body) });
-        tile.session = data.session;
-        tile.messages = data.session.messages || [];
-        tile.sid = data.session.session_id;
-        if (typeof S !== 'undefined') S.session = tile.session;
-        if (typeof syncTopbar === 'function') syncTopbar();
-        _updateTileHeader(tile);
-      } catch(e) {
-        if (typeof showToast === 'function') showToast('Failed to create session', 3000, 'error');
-        return;
+      // Sync S.messages back to tile
+      if (S.messages && S.messages.length > 0) {
+        tile.messages = [...S.messages];
       }
-    }
+      tile.busy = !!S.busy;
+      tile.activeStreamId = S.activeStreamId || null;
 
-    // Push user message
-    tile.messages.push({ role: 'user', content: text });
-    if (typeof S !== 'undefined') S.messages = tile.messages;
-    _renderTileMessages(tile);
-    tile.busy = true;
-    _updateTileHeader(tile);
-
-    try {
-      const body = {
-        session_id: tile.sid,
-        message: text,
-        model: tile.session.model || window._defaultModel || '',
-        model_provider: tile.session.model_provider || null,
-        profile: 'default',
-      };
-      const res = await fetch(new URL('/api/chat', document.baseURI || location.href).href, {
-        method: 'POST', credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const data = await res.json();
-      tile.activeStreamId = data.stream_id || null;
-      if (tile.session) tile.session.active_stream_id = tile.activeStreamId;
-      if (typeof S !== 'undefined') S.activeStreamId = tile.activeStreamId;
-      if (typeof INFLIGHT !== 'undefined') {
-        INFLIGHT[tile.sid] = { messages: [...tile.messages], uploaded: [], toolCalls: [] };
+      // When stream completes (was busy, now not), sync header
+      if (!S.busy && tile.session) {
+        tile.session = S.session;
       }
 
-      // Poll for stream completion — check tile's own state, not global S
-      const poll = setInterval(async () => {
-        try {
-          const status = await fetch(`/api/session?session_id=${encodeURIComponent(tile.sid)}&messages=1&fields=busy,active_stream_id`).then(r => r.json());
-          const sess = status && status.session;
-          if (!sess || (!sess.busy && !sess.active_stream_id)) {
-            clearInterval(poll);
-            tile.messages = (sess && sess.messages) || tile.messages;
-            tile.busy = false;
-            tile.activeStreamId = null;
-            _renderTileMessages(tile);
-            _updateTileHeader(tile);
-          }
-        } catch(_) { /* retry on next tick */ }
-      }, 1000);
-    } catch(e) {
-      tile.busy = false;
       _updateTileHeader(tile);
-      if (typeof showToast === 'function') showToast('Send failed: ' + (e.message || ''), 3000, 'error');
-    }
+    }, 500);
+  }
+
+  function _stopBusyWatcher() {
+    if (T._busyWatcher) { clearInterval(T._busyWatcher); T._busyWatcher = null; }
   }
 
   // ── Sidebar badge ────────────────────────────────────────────────────────
@@ -392,7 +382,6 @@
     document.body.classList.toggle('tiling-mode', T._tilingMode);
     try { localStorage.setItem('hermes-tiling-mode', T._tilingMode ? '1' : '0'); } catch(_) {}
 
-    // When tiling on: replace #msgInner with tile grid
     if (T._tilingMode) {
       _showTileGrid();
     } else {
@@ -409,35 +398,39 @@
   function _showTileGrid() {
     T._msgInner = document.getElementById('msgInner');
     if (!T._msgInner) return;
-    T._msgInnerParent = T._msgInner.parentNode;
-    if (!T._msgInnerParent) return;
+    T._msgInnerOriginalParent = T._msgInner.parentNode;
+    T._msgInnerOriginalNextSibling = T._msgInner.nextSibling;
 
-    // Hide the original messages and show tile grid in its place
-    T._msgInner.style.display = 'none';
-
-    // Create grid if not yet created
-    if (!T.gridEl) {
-      T.gridEl = document.createElement('div');
-      T.gridEl.id = 'tileGrid';
-      T.gridEl.className = 'tile-grid tile-grid--empty';
-      T._msgInnerParent.appendChild(T.gridEl);
-    }
+    // Show the tile grid
     T.gridEl.style.display = '';
 
-    // Hide the empty state since tile grid is now the content area
-    const emptyState = document.getElementById('emptyState');
-    if (emptyState) emptyState.style.display = 'none';
+    // Move #msgInner to the grid (will be placed into focused tile on focusTile)
+    T.gridEl.appendChild(T._msgInner);
   }
 
   function _hideTileGrid() {
-    if (T.gridEl) T.gridEl.style.display = 'none';
-    if (T._msgInner) T._msgInner.style.display = '';
+    _stopBusyWatcher();
 
-    // Restore empty state if there are no messages in the main view
-    const emptyState = document.getElementById('emptyState');
-    if (emptyState && T._msgInner && !T._msgInner.children.length) {
-      emptyState.style.display = '';
+    // Move #msgInner back to its original position
+    if (T._msgInner && T._msgInnerOriginalParent) {
+      if (T._msgInnerOriginalNextSibling && T._msgInnerOriginalNextSibling.parentNode === T._msgInnerOriginalParent) {
+        T._msgInnerOriginalParent.insertBefore(T._msgInner, T._msgInnerOriginalNextSibling);
+      } else {
+        T._msgInnerOriginalParent.appendChild(T._msgInner);
+      }
     }
+
+    // Hide grid
+    T.gridEl.style.display = 'none';
+
+    // Reset S to null/empty
+    if (typeof S !== 'undefined') {
+      S.session = null;
+      S.messages = [];
+      S.busy = false;
+      S.activeStreamId = null;
+    }
+    if (typeof syncTopbar === 'function') syncTopbar();
   }
 
   function isTilingMode() { return !!T._tilingMode; }
@@ -445,15 +438,15 @@
   // ── Init ─────────────────────────────────────────────────────────────────
 
   function initTiles() {
-    // Create tile grid DOM early but hidden
     const mainChat = document.getElementById('mainChat');
     if (!mainChat) return;
 
-    // Create grid element adjacent to #msgInner, initially hidden
     T.gridEl = document.createElement('div');
     T.gridEl.id = 'tileGrid';
     T.gridEl.className = 'tile-grid tile-grid--empty';
     T.gridEl.style.display = 'none';
+
+    // Place grid after #messages (sibling of #msgInner)
     const msgInner = document.getElementById('msgInner');
     if (msgInner && msgInner.parentNode) {
       msgInner.parentNode.appendChild(T.gridEl);
