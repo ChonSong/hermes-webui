@@ -105,9 +105,20 @@ function openTile(sid,data){
 
 // ── Render messages ──
 function renderMsgs(t){
-  const mi=t.el&&t.el.querySelector('.ext-tile-msg-inner');if(!mi)return;mi.innerHTML='';
-  const cr=window._createMessageElement;
-  (t.messages||[]).forEach(msg=>{if(!msg||!msg.role||msg.role==='tool')return;if(typeof cr==='function'){const el=cr(msg);if(el)mi.appendChild(el)}else{const d=document.createElement('div');d.textContent=typeof msg.content==='string'?msg.content.slice(0,500):'(content)';mi.appendChild(d)}});
+  const mi=t.el&&t.el.querySelector('.ext-tile-msg-inner');if(!mi)return;
+  // Use core renderTranscript hook if available (clean markdown, no DOM hacking)
+  if(typeof window.renderTranscript==='function'){
+    window.renderTranscript(mi, t.messages||[], {skipEmpty:false});
+  }else{
+    // Fallback: plain-text with _createMessageElement or direct content
+    mi.innerHTML='';
+    const cr=window._createMessageElement;
+    (t.messages||[]).forEach(msg=>{
+      if(!msg||!msg.role||msg.role==='tool')return;
+      if(typeof cr==='function'){const el=cr(msg);if(el)mi.appendChild(el)}
+      else{const d=document.createElement('div');d.textContent=typeof msg.content==='string'?msg.content:'(content)';mi.appendChild(d)}
+    });
+  }
   mi.scrollTop!==undefined&&(mi.scrollTop=mi.scrollHeight);
 }
 
@@ -157,7 +168,8 @@ function stopWatcher(){T._w&&(clearInterval(T._w),T._w=null)}
 // ── Sidebar badge ──
 function badge(sid,delta){
   if(!sid)return;T._tc[sid]=(T._tc[sid]||0)+delta;
-  const row=document.querySelector(`[data-session-id="${sid}"]`);if(!row)return;
+  var safeId=(typeof CSS!=='undefined'&&CSS.escape)?CSS.escape(sid):sid.replace(/[^a-zA-Z0-9_-]/g,'');
+  const row=document.querySelector('[data-session-id="'+safeId+'"]');if(!row)return;
   let b=row.querySelector('.ext-tile-sidebar-badge');
   if(T._tc[sid]>0&&gs('show_sidebar_badges',true)){if(!b){b=document.createElement('span');b.className='ext-tile-sidebar-badge';(row.querySelector('.session-row-right')||row.querySelector('.session-meta')||row).appendChild(b)}b.textContent=T._tc[sid]>9?'9+':String(T._tc[sid])}
   else if(b)b.remove()
@@ -184,6 +196,7 @@ function showGrid(cols,rows){
 }
 
 function hideGrid(){
+  if(!T.visible&&!T._saved){tbActive();return}
   T.visible=false;stopWatcher();
   document.querySelectorAll('.ext-tile-msg-inner[id="msgInner"]').forEach(el=>el.removeAttribute('id'));
   const o=document.querySelector('#messages>.messages-inner--idle');if(o){o.id='msgInner';o.classList.remove('messages-inner--idle')}
@@ -204,6 +217,27 @@ function closeAll(){
 
 // ── Sidebar click interception ──
 function initCapture(){
+  // Use core registerHermesSessionOpenHandler hook when available (cleaner than
+  // MutationObserver on the DOM — no event interception needed).
+  if(typeof window.registerHermesSessionOpenHandler==='function'&&typeof window._hermesNotifySessionOpen==='function'){
+    window.registerHermesSessionOpenHandler(function(sid, data, opts){
+      if(!T.visible) return {};
+      if(opts&&opts.loaded&&sid){
+        // Find a free tile and fill it with this session's data
+        const t=T.tiles.find(t=>!t.sid);
+        if(t&&data){
+          // Don't open the same session in two tiles
+          if(T.tiles.some(x=>x.sid===sid&&x!==t)) return {};
+          t.sid=sid;t.session=data;t.messages=(data.messages)||[];t.cv='';t.mv=null;
+          updateHeader(t);badge(sid,1);renderMsgs(t);focusTile(t.id);
+          if(!t.messages.length&&sid){(async()=>{try{const f=await window.api(`/api/session?session_id=${encodeURIComponent(sid)}&resolve_model=0`);if(f&&f.messages){t.messages=f.messages||[];t.session=f;if(T.activeId===t.id&&typeof S!=='undefined'){S.messages=t.messages;S.session=t.session}renderMsgs(t);updateHeader(t)}}catch(_){}})()}
+        }
+      }
+      return {};
+    });
+    return;
+  }
+  // Fallback: MutationObserver-based sidebar interception for older core
   const obs=new MutationObserver(()=>{
     const s=document.getElementById('sessionSidebar')||document.querySelector('.sidebar-session-list');
     if(s&&!s.dataset.extTilingWired){s.dataset.extTilingWired='1';s.addEventListener('click',onSidebarClick,true)}
