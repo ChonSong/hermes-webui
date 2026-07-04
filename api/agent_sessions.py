@@ -176,7 +176,11 @@ def is_cli_session_row(row: dict) -> bool:
     source_label = _safe_lower(row.get("source_label"))
     if "webui" in {source, source_tag, raw_source, source_name, source_label}:
         return False
-    non_cli_sources = MESSAGING_SOURCES | {"cron", "webhook", "tool", "api", "api_server"}
+    # 'subagent' is a delegated delegate_task child: view-only, owned by the
+    # runner, never a writable WebUI/CLI session (#5307). Classify it non-CLI so
+    # sidebar rows and every is_cli_session_row() consumer keep it out of the
+    # CLI/writable treatment.
+    non_cli_sources = MESSAGING_SOURCES | {"cron", "webhook", "tool", "api", "api_server", "subagent"}
     if {source, source_tag, raw_source, source_name, source_label} & non_cli_sources:
         return False
     if source == "messaging":
@@ -449,7 +453,22 @@ def read_importable_agent_session_rows(
         return []
 
     log = log or logger
-    with closing(sqlite3.connect(str(db_path))) as conn:
+    # Open read-only for this projection/listing path: it is a pure read, and
+    # holding a write-capable handle on the live (multi-GB, WAL) state.db while
+    # the agent streams into it adds needless checkpoint/lock surface (#5455).
+    # The defensive index self-heal below still runs, but through a separate
+    # short-lived writable connection on the rare missing-index path only.
+    read_only_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    try:
+        conn = sqlite3.connect(read_only_uri, uri=True)
+    except sqlite3.Error as exc:
+        log.warning(
+            "agent session listing read-only open failed for %s; falling back to writable connection: %s",
+            db_path,
+            exc,
+        )
+        conn = sqlite3.connect(str(db_path))
+    with closing(conn):
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
@@ -507,16 +526,21 @@ def read_importable_agent_session_rows(
                 messages_index_present = any(str(row[1]) == "idx_messages_session" for row in cur.fetchall())
             except sqlite3.Error:
                 messages_index_present = False
-            try:
-                if not messages_index_present:
-                    cur.execute(
-                        "CREATE INDEX IF NOT EXISTS idx_messages_session "
-                        "ON messages(session_id, timestamp)"
-                    )
-                    conn.commit()
+            if not messages_index_present:
+                # Self-heal via a separate writable connection so the common
+                # (index-present) path keeps its read-only handle. On a truly
+                # read-only/locked db this fails and we degrade to the
+                # pre-aggregated cron-only path below, exactly as before.
+                try:
+                    with closing(sqlite3.connect(str(db_path))) as _heal:
+                        _heal.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_messages_session "
+                            "ON messages(session_id, timestamp)"
+                        )
+                        _heal.commit()
                     messages_index_present = True
-            except sqlite3.Error:
-                pass  # read-only db / locked / older schema — degrade gracefully
+                except sqlite3.Error:
+                    pass  # read-only db / locked / older schema — degrade gracefully
 
         if use_messages_join:
             actual_count_expr = f"COUNT(m.{count_col})"

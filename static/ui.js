@@ -824,17 +824,71 @@ function _captureMessageViewportAnchor(){
   }
   return null;
 }
+// Temporarily suppress the browser's native overflow-anchor on a scroll
+// container so a JS scrollTop write is not double-compensated by the browser's
+// own scroll-anchoring in the same frame. Returns a release fn that restores the
+// prior inline value on the NEXT frame (after layout settles). No-op on desktop,
+// where the resting computed value is already `none` (CSS hover/fine-pointer
+// media query) — suppressing `none` changes nothing and the release restores the
+// same empty inline value. Only mobile (resting `auto`) is actually affected,
+// which is exactly where the double-compensation jump-back happens.
+//
+// Both this helper and _fixMobileScrollJank() gate on the SAME question — "is
+// the browser's native scroll-anchor layer currently active on this element?" —
+// routed through this one predicate so the two guards can't drift apart if the
+// CSS media query ever changes (maintainer review on #5338). The computed-value
+// test is more robust than a matchMedia('(hover:hover) and (pointer:fine)')
+// check because it reflects the real resting value, including any inline
+// override, not just the viewport media state.
+function _browserOverflowAnchorActive(el){
+  if(!el) return false;
+  try{ return getComputedStyle(el).overflowAnchor==='auto'; }catch(_){ return false; }
+}
+function _suppressBrowserOverflowAnchor(container){
+  if(!container||!container.style) return null;
+  // Only engage when the browser layer is actually active (auto). On desktop
+  // (none) there is nothing to suppress.
+  if(!_browserOverflowAnchorActive(container)) return null;
+  const prevInline=container.style.overflowAnchor||'';
+  container.style.overflowAnchor='none';
+  let released=false;
+  return function _release(){
+    if(released) return;
+    released=true;
+    const restore=()=>{
+      // Only restore if we still own the suppression (another render may have
+      // re-set it); compare against the value we wrote.
+      if(container.style.overflowAnchor==='none') container.style.overflowAnchor=prevInline;
+    };
+    if(typeof requestAnimationFrame==='function') requestAnimationFrame(restore);
+    else restore();
+  };
+}
 function _restoreMessageViewportAnchor(anchor, rawIdxDelta){
   const container=$('messages');
   if(!container||!anchor) return false;
   const anchorKey=String(anchor.key||'');
-  let row=anchorKey?Array.from(container.querySelectorAll('[data-message-anchor-key]')).find(el=>el&&el.dataset&&el.dataset.messageAnchorKey===anchorKey):null;
-  if(row&&row.getClientRects&&row.getClientRects().length===0) row=null;
-  if(!row&&anchorKey) return false;
   const sessionIdx=Number(anchor.sessionIdx);
   const hasSessionIdx=Number.isFinite(sessionIdx);
+  let row=anchorKey?Array.from(container.querySelectorAll('[data-message-anchor-key]')).find(el=>el&&el.dataset&&el.dataset.messageAnchorKey===anchorKey):null;
+  if(row&&row.getClientRects&&row.getClientRects().length===0) row=null;
+  // The anchor key is content-derived (role|ts|attachments|first-160-chars, built by
+  // _messageViewportAnchorKeyForMessage) so it goes STALE while a live assistant
+  // message is still streaming: every chunk that changes the first 160 chars
+  // recomputes that row's data-message-anchor-key, so a snapshot captured mid-stream
+  // no longer matches by key. We used to concede the moment the keyed lookup missed
+  // (`if(!row&&anchorKey) return false`), and the caller then fell back to an ABSOLUTE
+  // scrollTop=snapshot.top that does NOT compensate the above-viewport height growth
+  // from that same streaming chunk — the residual DESKTOP scroll jump-back. (Desktop
+  // rests at overflow-anchor:none, so #5392's mobile overflow-anchor guard is a no-op
+  // here; this is a distinct code path.) The anchored row is still in the DOM under
+  // its STABLE session-relative index, so recover it via sessionIdx before conceding.
+  // A genuinely removed anchor (message compressed/deleted away) misses key AND
+  // sessionIdx and still returns false. A missing sessionIdx is NOT degraded to the
+  // window-relative rawIdx (which could resolve to a different message), preserving
+  // the original per-tier guard.
   if(!row&&hasSessionIdx) row=container.querySelector(`[data-session-msg-idx="${sessionIdx}"]`);
-  if(!row&&hasSessionIdx) return false;
+  if(!row&&(anchorKey||hasSessionIdx)) return false;
   const targetIdx=Number(anchor.rawIdx)+Number(rawIdxDelta||0);
   if(!row&&Number.isFinite(targetIdx)) row=container.querySelector(`[data-msg-idx="${targetIdx}"]`);
   if(!row) return false;
@@ -842,7 +896,19 @@ function _restoreMessageViewportAnchor(anchor, rawIdxDelta){
   const rect=row.getBoundingClientRect();
   const targetTop=Number(anchor.topOffset)||0;
   _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
+  // Mobile-only jump fix: the resting overflow-anchor on .messages is `auto` on
+  // touch devices (CSS media query keeps it `none` only for hover+fine-pointer
+  // desktops). When we write scrollTop here to realign the anchor row, a mobile
+  // browser's OWN overflow-anchor machinery ALSO shifts scrollTop in the same
+  // frame if content height above the viewport changed — the two compensations
+  // stack and yank the reader to an unrelated turn (the mobile jump-back). This is why the
+  // bug is mobile-only and never reproduces on a desktop (none) browser. Suppress
+  // the browser layer for this write; _releaseAnchorSuppression restores it next
+  // frame. Desktop is already `none`, so this is a no-op there.
+  const _releaseAnchorSuppression=(typeof _suppressBrowserOverflowAnchor==='function')
+    ? _suppressBrowserOverflowAnchor(container) : null;
   container.scrollTop+=(rect.top-containerRect.top)-targetTop;
+  if(_releaseAnchorSuppression) _releaseAnchorSuppression();
   if(typeof _deferClearProgrammaticScroll==='function') _deferClearProgrammaticScroll();
   else requestAnimationFrame(()=>{ setTimeout(()=>{ _programmaticScroll=false; },0); });
   return true;
@@ -1347,6 +1413,7 @@ function _openImgLightbox(imgEl) {
 const _MERMAID_VIEWER_MIN_SCALE = 0.25;
 const _MERMAID_VIEWER_MAX_SCALE = 8;
 const _MERMAID_VIEWER_ZOOM_STEP = 1.2;
+const _MERMAID_VIEWER_INLINE_MIN_HEIGHT = 220;
 
 function _mermaidViewerIcon(kind) {
   const icons = {
@@ -1451,14 +1518,58 @@ function _mountMermaidViewer(svgEl, options = {}) {
   };
   root._mermaidViewer = state;
 
+  function _lightboxViewportEnvelope() {
+    const width = Math.round((window.innerWidth || box.width) * 0.9);
+    const height = Math.round((window.innerHeight || box.height) * 0.9);
+    return {
+      width: Math.max(1, Number.isFinite(width) ? width : 1),
+      height: Math.max(1, Number.isFinite(height) ? height : 1),
+    };
+  }
+
+  function _viewportFallbackSize(){
+    if(mode === 'lightbox') return _lightboxViewportEnvelope();
+    const width = Math.round(window.innerWidth || box.width);
+    const height = Math.round((window.innerHeight || box.height) * 0.7);
+    return {
+      width: Math.max(1, Number.isFinite(width) ? width : 1),
+      height: Math.max(1, Number.isFinite(height) ? height : 1),
+    };
+  }
+
   function _viewportSize(){
     const rect = viewport.getBoundingClientRect ? viewport.getBoundingClientRect() : null;
-    const width = viewport.clientWidth || (rect && rect.width) || (mode === 'lightbox' ? Math.round((window.innerWidth || box.width) * 0.9) : Math.round(window.innerWidth || box.width));
-    const height = viewport.clientHeight || (rect && rect.height) || (mode === 'lightbox' ? Math.round((window.innerHeight || box.height) * 0.9) : Math.round((window.innerHeight || box.height) * 0.7));
+    const fallback = _viewportFallbackSize();
+    const width = mode === 'lightbox'
+      ? fallback.width
+      : (viewport.clientWidth || (rect && rect.width) || fallback.width);
+    const height = mode === 'lightbox'
+      ? fallback.height
+      : (viewport.clientHeight || (rect && rect.height) || fallback.height);
     return {
       width: Math.max(1, Number(width) || box.width || 1),
       height: Math.max(1, Number(height) || box.height || 1),
     };
+  }
+
+  function _rawFitScale(size){
+    return Math.min(size.width / Math.max(1, box.width), size.height / Math.max(1, box.height));
+  }
+
+  function _minScale(){
+    // Inline stays bounded by readable-height minimum to preserve usability.
+    // Lightbox allows fit-to-screen to shrink below the old 0.25 floor when
+    // the diagram envelope is narrower than 25%.
+    if(mode === 'lightbox') return Math.min(_MERMAID_VIEWER_MIN_SCALE, _rawFitScale(_viewportSize()));
+    return Math.min(_MERMAID_VIEWER_MIN_SCALE, _inlineViewportHeight() / Math.max(1, box.height));
+  }
+
+  function _inlineViewportHeight(){
+    const size = _viewportSize();
+    const widthFitScale = size.width / Math.max(1, box.width);
+    const widthBasedHeight = Math.max(1, Math.round(box.height * widthFitScale));
+    const fallback = _viewportFallbackSize();
+    return Math.min(fallback.height, Math.max(_MERMAID_VIEWER_INLINE_MIN_HEIGHT, widthBasedHeight));
   }
 
   function _applyTransform(){
@@ -1476,11 +1587,11 @@ function _mountMermaidViewer(svgEl, options = {}) {
 
   function _fitScale(){
     const size = _viewportSize();
-    return Math.max(_MERMAID_VIEWER_MIN_SCALE, Math.min(_MERMAID_VIEWER_MAX_SCALE, Math.min(size.width / box.width, size.height / box.height)));
+    return Math.max(_minScale(), Math.min(_MERMAID_VIEWER_MAX_SCALE, _rawFitScale(size)));
   }
 
   function _setScale(nextScale, anchorX, anchorY){
-    const bounded = Math.max(_MERMAID_VIEWER_MIN_SCALE, Math.min(_MERMAID_VIEWER_MAX_SCALE, nextScale));
+    const bounded = Math.max(_minScale(), Math.min(_MERMAID_VIEWER_MAX_SCALE, nextScale));
     if(!Number.isFinite(bounded) || !box.width || !box.height) return;
     const focusX = Number.isFinite(anchorX) ? anchorX : _viewportSize().width / 2;
     const focusY = Number.isFinite(anchorY) ? anchorY : _viewportSize().height / 2;
@@ -1495,8 +1606,28 @@ function _mountMermaidViewer(svgEl, options = {}) {
 
   function _fitViewer(){
     const nextScale = _fitScale();
+    state.fitScale = nextScale;
     state.scale = nextScale;
     _centerForScale(nextScale);
+    _applyTransform();
+  }
+
+  function _resizeToEnvelope(){
+    if(mode !== 'lightbox') return;
+    const hadFitScale = Number.isFinite(state.fitScale);
+    const previousFitScale = hadFitScale ? state.fitScale : _fitScale();
+    const wasAtFit = !hadFitScale || Math.abs(state.scale - previousFitScale) < 1e-9;
+    const envelope = _lightboxViewportEnvelope();
+    viewport.style.width = Math.max(1, Math.round(envelope.width)) + 'px';
+    viewport.style.height = Math.max(1, Math.round(envelope.height)) + 'px';
+    const nextFitScale = _fitScale();
+    state.fitScale = nextFitScale;
+    if(wasAtFit){
+      state.scale = nextFitScale;
+      _centerForScale(state.scale);
+    } else {
+      state.scale = Math.max(_minScale(), Math.min(_MERMAID_VIEWER_MAX_SCALE, state.scale));
+    }
     _applyTransform();
   }
 
@@ -1586,6 +1717,7 @@ function _mountMermaidViewer(svgEl, options = {}) {
   state.zoomOut = _zoomOut;
   state.zoomAt = _setScale;
   state.applyTransform = _applyTransform;
+  state.resizeToEnvelope = _resizeToEnvelope;
   state.openLightbox = openLightbox;
 
   toolbar.appendChild(_createMermaidViewerButton('Zoom in', 'zoomIn', _zoomIn));
@@ -1596,16 +1728,16 @@ function _mountMermaidViewer(svgEl, options = {}) {
     toolbar.appendChild(_createMermaidViewerButton('Fullscreen', 'fullscreen', openLightbox));
   }
 
-  const initialFit = _fitScale();
-  state.scale = initialFit;
-  _centerForScale(initialFit);
-  _applyTransform();
   if(mode === 'lightbox'){
-    viewport.style.width = Math.max(1, Math.round(box.width * initialFit)) + 'px';
-    viewport.style.height = Math.max(1, Math.round(box.height * initialFit)) + 'px';
+    state.resizeToEnvelope();
   } else {
+    const initialHeight = _inlineViewportHeight();
+    const readableScale = initialHeight / Math.max(1, box.height);
+    state.scale = Math.max(_minScale(), Math.min(_MERMAID_VIEWER_MAX_SCALE, readableScale));
     viewport.style.width = '100%';
-    viewport.style.height = Math.max(1, Math.round(box.height * initialFit)) + 'px';
+    viewport.style.height = Math.max(1, Math.round(initialHeight)) + 'px';
+    _centerForScale(state.scale);
+    _applyTransform();
   }
 
   return root;
@@ -1655,6 +1787,18 @@ function _openMermaidLightbox(svgEl) {
   clone.removeAttribute('width');
   clone.removeAttribute('height');
   const viewer = _mountMermaidViewer(clone, {mode:'lightbox'});
+  if(viewer && viewer._mermaidViewer && typeof viewer._mermaidViewer.resizeToEnvelope === 'function'){
+    lb._mermaidResizeHandler = () => {
+      if(lb._mermaidResizeTimer && typeof clearTimeout === 'function') clearTimeout(lb._mermaidResizeTimer);
+      lb._mermaidResizeTimer = setTimeout(() => {
+        lb._mermaidResizeTimer = null;
+        viewer._mermaidViewer.resizeToEnvelope();
+      }, 120);
+    };
+    if(window && typeof window.addEventListener === 'function'){
+      window.addEventListener('resize', lb._mermaidResizeHandler);
+    }
+  }
   const cls = document.createElement('button');
   cls.className = 'img-lightbox-close';
   cls.setAttribute('aria-label', 'Close');
@@ -1668,6 +1812,7 @@ function _openMermaidLightbox(svgEl) {
   };
   document.body.appendChild(lb);
   document.addEventListener('keydown', lb._keyHandler);
+  return lb;
 }
 function _openImgLightboxWithNav(src, alt, images, index) {
   const lb = document.createElement('div');
@@ -1738,6 +1883,13 @@ function _navigateLightbox(lb, direction) {
 function _closeImgLightbox(lb) {
   if(!lb || !lb.parentNode) return;
   document.removeEventListener('keydown', lb._keyHandler);
+  if(lb._mermaidResizeHandler && window && typeof window.removeEventListener === 'function'){
+    window.removeEventListener('resize', lb._mermaidResizeHandler);
+  }
+  if(lb._mermaidResizeTimer && typeof clearTimeout === 'function'){
+    clearTimeout(lb._mermaidResizeTimer);
+    lb._mermaidResizeTimer = null;
+  }
   lb.style.animation = 'lb-in .12s ease reverse';
   setTimeout(() => lb.parentNode && lb.parentNode.removeChild(lb), 120);
 }
@@ -2338,6 +2490,7 @@ function _persistSessionModelCorrection(model, provider, opts){
   return opts&&opts.propagateErrors ? request : request.catch(()=>{});
 }
 let _modelDropdownRequestSeq=0;
+let _modelCatalogFallbackRetried=false;
 
 function _applySessionModelFallback(sel){
   if(!sel) return null;
@@ -2361,10 +2514,13 @@ function _applySessionModelFallback(sel){
 async function populateModelDropdown(opts={}){
   const sel=$('modelSelect');
   if(!sel) return;
+  // `_activeProvider` is refreshed from the /api/models response below.
   if(typeof _modelDropdownRequestSeq!=='number') _modelDropdownRequestSeq=0;
+  if(typeof _modelCatalogFallbackRetried!=='boolean') _modelCatalogFallbackRetried=false;
   const requestSeq=++_modelDropdownRequestSeq;
   try{
     const modelsUrl=new URL('api/models',document.baseURI||location.href);
+    const requestedFreshness=opts&&opts.freshness?String(opts.freshness):'';
     if(opts&&opts.freshness) modelsUrl.searchParams.set('freshness',opts.freshness);
     const _modelsRes=await fetch(modelsUrl.href,{credentials:'include'});
     if(requestSeq!==_modelDropdownRequestSeq) return;
@@ -2417,11 +2573,19 @@ async function populateModelDropdown(opts={}){
       return groups;
     };
 
-    const groups=(Array.isArray(data.groups)&&data.groups.length)
-      ? data.groups
-      : _synthGroupsFromConfigured();
+    const usedConfiguredFallback=!(Array.isArray(data.groups)&&data.groups.length);
+    const groups=usedConfiguredFallback
+      ? _synthGroupsFromConfigured()
+      : data.groups;
+    const willRetry=usedConfiguredFallback && requestedFreshness!=='session_visit' && !_modelCatalogFallbackRetried;
 
-    if(!groups.length) return; // no server groups and no configured fallback
+    if(!groups.length){
+      if(willRetry){
+        _modelCatalogFallbackRetried=true;
+        populateModelDropdown({...opts,freshness:'session_visit'}).catch(()=>{});
+      }
+      return; // no server groups and no configured fallback
+    }
     const previousSelection=_captureModelDropdownSelection(sel);
     // Clear existing options
     sel.innerHTML='';
@@ -2465,7 +2629,11 @@ async function populateModelDropdown(opts={}){
     }
     // Kick off a background live-model fetch for the active provider.
     // This runs after the static list is already shown (no blocking flicker).
-    if(data.active_provider) _fetchLiveModels(data.active_provider, sel, requestSeq);
+    if(data.active_provider && !willRetry) _fetchLiveModels(data.active_provider, sel, requestSeq);
+    if(willRetry){
+      _modelCatalogFallbackRetried=true;
+      populateModelDropdown({...opts,freshness:'session_visit'}).catch(()=>{});
+    }
   }catch(e){
     if(requestSeq!==_modelDropdownRequestSeq) return;
     // API unavailable -- keep the hardcoded HTML options as fallback
@@ -5212,6 +5380,26 @@ function _messageBottomDistance(){
   if(!el) return 0;
   return el.scrollHeight-el.scrollTop-el.clientHeight;
 }
+// #5514/#5515: when the composer grows (typing multiple rows, Shift+Enter, a
+// multi-line paste / WisprFlow), the flex:1 `.messages` viewport shrinks by the
+// same delta. A reader pinned to the bottom is then stranded Δpx above it — the
+// transcript appears to "scroll up" one row per composer row, and (the #5515
+// half) it reads as a random upward jump during normal use. autoResize() only
+// resized the textarea; nothing re-pinned the transcript. Re-pin the bottom, but
+// ONLY when the reader is genuinely still pinned (sticky-unpin model: honor
+// _messageUserUnpinned so we never yank a reader who scrolled away, and never
+// fight a stream that already unpinned). Cheap no-op when not pinned.
+function _repinMessagesAfterComposerResize(){
+  if(_messageUserUnpinned || !_scrollPinned) return;
+  const el=$('messages');
+  if(!el) return;
+  // Already at/very near the bottom? nothing to do (avoids needless writes while
+  // idle-reading a short conversation that isn't scrollable).
+  if(_messageBottomDistance()<=1) return;
+  if(typeof _setMessageScrollToBottom==='function') _setMessageScrollToBottom();
+  else { el.scrollTop=el.scrollHeight; }
+}
+if(typeof window!=='undefined') window._repinMessagesAfterComposerResize=_repinMessagesAfterComposerResize;
 function _shouldFollowMessagesOnDomReplace(){
   // Final stream settlement replaces the live DOM with persisted messages. Keep
   // following only for users who are still pinned or effectively at the tail.
@@ -6334,12 +6522,12 @@ function getComposerPrimaryAction(){
   }
   const explicitAction=_getExplicitBusyCommandAction(msg&&msg.value);
   if(explicitAction) return explicitAction;
-  const busyMode=window._busyInputMode||'queue';
-  if(busyMode==='steer'){
+  const defaultMessageMode=window._defaultMessageMode||'steer';
+  if(defaultMessageMode==='steer'){
     if(S.activeStreamId&&typeof _trySteer==='function') return 'steer';
     return 'queue';
   }
-  if(busyMode==='interrupt'){
+  if(defaultMessageMode==='interrupt'){
     if(S.activeStreamId&&typeof cancelStream==='function') return 'interrupt';
     return 'queue';
   }
@@ -6357,7 +6545,7 @@ function _applyBusyComposerPlaceholder(){
     input.placeholder=idlePlaceholder;
     return;
   }
-  const busyMode=window._busyInputMode||'queue';
+  const busyMode=window._defaultMessageMode||'steer';
   const busyPlaceholderKey=busyMode==='interrupt'
     ? 'composer_placeholder_busy_interrupt'
     : busyMode==='steer'
@@ -6437,7 +6625,7 @@ async function handleComposerPrimaryAction(){
   const action=typeof getComposerPrimaryAction==='function'?getComposerPrimaryAction():'send';
   if(action==='disabled') return;
   if(action==='stop'){
-    if(typeof cancelStream==='function') await cancelStream();
+    if(typeof cancelStream==='function') await cancelStream('composer-stop');
     return;
   }
   await send();
@@ -7855,7 +8043,7 @@ function restoreLiveTurnHtmlForSession(sid){
   const liveGroup=restored.querySelector('.tool-call-group[data-live-tool-call-group="1"]');
   if(liveGroup&&typeof _startActivityElapsedTimer==='function') _startActivityElapsedTimer(liveGroup);
   if(typeof placeLiveToolCardsHost==='function') placeLiveToolCardsHost();
-  requestAnimationFrame(()=>postProcessRenderedMessages(restored));
+  requestAnimationFrame(()=>_postProcessWithAnchorSuppression(restored));
   return true;
 }
 
@@ -8166,11 +8354,62 @@ function _hideUpdateSummaryPanel(){
   const panel=$('updateSummaryPanel');
   const text=$('updateSummaryText');
   const links=$('updateSummaryDiffLinks');
-  if(panel) panel.style.display='none';
+  const toolbar=$('updateSummaryToolbar');
+  if(panel){
+    panel.style.display='none';
+    panel.classList.remove('update-summary-expanded');
+  }
+  if(toolbar) toolbar.style.display='none';
+  _syncUpdateSummaryExpandButton(false);
   if(text) text.textContent='';
   if(links){links.replaceChildren();links.style.display='none';}
 }
+function _syncUpdateSummaryExpandButton(expanded){
+  const btn=$('btnUpdateSummaryExpand');
+  if(!btn) return;
+  btn.setAttribute('aria-expanded',expanded?'true':'false');
+  btn.textContent=expanded?'Collapse summary':'Expand summary';
+}
+function toggleUpdateSummaryExpanded(){
+  const panel=$('updateSummaryPanel');
+  if(!panel||panel.style.display==='none') return;
+  const expanded=!panel.classList.contains('update-summary-expanded');
+  panel.classList.toggle('update-summary-expanded',expanded);
+  _syncUpdateSummaryExpandButton(expanded);
+}
 const WHATS_NEW_SUMMARY_STORAGE_KEY='hermes-whats-new-generated-summaries';
+const WHATS_NEW_SUMMARY_STORAGE_MAX_BYTES=256*1024;
+function _summaryStorageByteLength(value){
+  const text=typeof value==='string'?value:JSON.stringify(value);
+  if(text==null) return 0;
+  if(typeof TextEncoder==='function') return new TextEncoder().encode(text).length;
+  let bytes=0;
+  for(const ch of text){
+    const code=ch.codePointAt(0);
+    bytes+=code<=0x7f?1:(code<=0x7ff?2:(code<=0xffff?3:4));
+  }
+  return bytes;
+}
+function _summaryCacheEntriesSortedByRecency(entries){
+  return entries.slice().sort((left,right)=>{
+    const leftKey=left[0];
+    const rightKey=right[0];
+    const leftSummary=left[1];
+    const rightSummary=right[1];
+    const leftUpdatedAt=leftSummary&&leftSummary.updatedAt;
+    const rightUpdatedAt=rightSummary&&rightSummary.updatedAt;
+    if(typeof leftUpdatedAt==='number'&&typeof rightUpdatedAt==='number'&&leftUpdatedAt!==rightUpdatedAt){
+      return rightUpdatedAt-leftUpdatedAt;
+    }
+    if(typeof leftUpdatedAt==='number') return -1;
+    if(typeof rightUpdatedAt==='number') return 1;
+    if(leftKey==='webui'&&rightKey!=='webui') return -1;
+    if(rightKey==='webui'&&leftKey!=='webui') return 1;
+    if(leftKey==='agent'&&rightKey!=='agent') return -1;
+    if(rightKey==='agent'&&leftKey!=='agent') return 1;
+    return leftKey<rightKey?-1:(leftKey>rightKey?1:0);
+  });
+}
 function _loadStoredUpdateSummaries(){
   window._whatsNewGeneratedSummaries=window._whatsNewGeneratedSummaries||{};
   try{
@@ -8184,7 +8423,18 @@ function _loadStoredUpdateSummaries(){
   return window._whatsNewGeneratedSummaries;
 }
 function _persistGeneratedSummaries(){
-  try{sessionStorage.setItem(WHATS_NEW_SUMMARY_STORAGE_KEY,JSON.stringify(window._whatsNewGeneratedSummaries||{}));}catch(_e){}
+  const current=window._whatsNewGeneratedSummaries||{};
+  const next={};
+  try{
+    _summaryCacheEntriesSortedByRecency(Object.entries(current)).forEach((entry)=>{
+      const candidate={...next,...Object.fromEntries([entry])};
+      if(_summaryStorageByteLength(JSON.stringify(candidate))<=WHATS_NEW_SUMMARY_STORAGE_MAX_BYTES){
+        Object.assign(next, Object.fromEntries([entry]));
+      }
+    });
+    window._whatsNewGeneratedSummaries=next;
+    sessionStorage.setItem(WHATS_NEW_SUMMARY_STORAGE_KEY,JSON.stringify(next));
+  }catch(_e){}
 }
 function _pruneGeneratedSummaries(data){
   const cache=_loadStoredUpdateSummaries();
@@ -8215,6 +8465,7 @@ function _rememberGeneratedSummary(target,payload,data){
   window._whatsNewGeneratedSummaries[target]={
     signature:_updateSummarySignature(data&&data[target]),
     payload:payload,
+    updatedAt:Date.now(),
   };
   _persistGeneratedSummaries();
 }
@@ -8222,8 +8473,12 @@ function _renderUpdateSummaryPanel(payload,data,targetKey){
   const panel=$('updateSummaryPanel');
   const text=$('updateSummaryText');
   const links=$('updateSummaryDiffLinks');
+  const toolbar=$('updateSummaryToolbar');
   if(!panel||!text) return;
   panel.style.display='block';
+  panel.classList.remove('update-summary-expanded');
+  _syncUpdateSummaryExpandButton(false);
+  if(toolbar) toolbar.style.display='flex';
   const sections=Array.isArray(payload&&payload.summary_sections)?payload.summary_sections:null;
   text.replaceChildren();
   if(sections&&sections.length){
@@ -10359,11 +10614,26 @@ function _anchorSceneNodeForRow(row, opts){
   if(row.role==='prose'){
     const text=String(row.text||'').trim();
     if(!text) return null;
-    node=document.createElement('div');
-    node.className='assistant-segment';
-    node.setAttribute('data-anchor-scene-prose','1');
-    node.dataset.rawText=text;
-    node.innerHTML=`<div class="msg-body">${renderMd?renderMd(text):esc(text)}</div>`;
+    // Incremental live rendering: reuse a persistent smd node fed only the delta
+    // instead of re-parsing the whole growing answer on every streamed frame
+    // (O(n^2) -> O(n)). Settled rows and any failure fall through to the full
+    // renderMd path below, which stays the source of truth for the final DOM.
+    const proseKey=row.local_id||row.row_id||'';
+    if(!settled && proseKey && typeof window.__anchorProseIncrementalNode==='function'){
+      const inc=window.__anchorProseIncrementalNode(proseKey,text);
+      // Route the incremental node through the shared row-decoration block below
+      // (data-anchor-scene-row / -row-id / -row-role / -source-event-type) instead
+      // of returning early — otherwise live incremental prose rows lose the
+      // identity attributes the scene reconciler matches on. (Codex gate #5466)
+      if(inc){ node=inc; }
+    }
+    if(!node){
+      node=document.createElement('div');
+      node.className='assistant-segment';
+      node.setAttribute('data-anchor-scene-prose','1');
+      node.dataset.rawText=text;
+      node.innerHTML=`<div class="msg-body">${renderMd?renderMd(text):esc(text)}</div>`;
+    }
   }else if(row.role==='thinking'){
     if(window._showThinking===false) return null;
     const text=String(row.text||row.thinking&&row.thinking.text||'').trim();
@@ -10733,7 +11003,26 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
   if(!blocks) return false;
   const scrollSnapshot=_captureMessageScrollSnapshot();
   const scrollRebuildGuard=_prepareLiveAnchorScrollRebuildGuard(scrollSnapshot);
-  blocks.querySelectorAll('[data-anchor-scene-owner="1"],[data-anchor-scene-row="1"]').forEach(el=>el.remove());
+  const activeStreamId = String(streamId || S.activeStreamId || '');
+  const activeSessionId = String(S.session && S.session.session_id || '');
+  const preserveByKey = new Map();
+  blocks.querySelectorAll('.transparent-event-row[data-live-stream-owned="1"][data-anchor-row-id]').forEach(node=>{
+    if(!node||!node.getAttribute) return;
+    const rowStream = String(node.getAttribute('data-anchor-stream-id') || '');
+    if(rowStream && rowStream !== activeStreamId) return;
+    const rowSession = String(node.getAttribute('data-session-id') || '');
+    if(rowSession && activeSessionId && rowSession !== activeSessionId) return;
+    const key = _transparentLiveRowKey(node, activeStreamId);
+    if(key && !preserveByKey.has(key)) preserveByKey.set(key, node);
+  });
+  blocks.querySelectorAll('[data-anchor-scene-owner="1"]').forEach(el=>el.remove());
+  blocks.querySelectorAll('[data-anchor-scene-row="1"]').forEach(el=>{
+    if(el.getAttribute('data-live-stream-owned') === '1'){
+      const key = _transparentLiveRowKey(el, activeStreamId);
+      if(key && preserveByKey.get(key) === el) return;
+    }
+    el.remove();
+  });
   // Clear every legacy live activity surface this renderer can replace. The
   // anchor-scene rows are now the source of truth for visible live activity.
   blocks.querySelectorAll(
@@ -10743,7 +11032,6 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     '.tool-card-row[data-live-tid],'+
     '.agent-activity-thinking[data-live-thinking="1"],'+
     '.transparent-event-row[data-live-tid],'+
-    '[data-live-stream-owned="1"],'+
     '.interim-collapse-toggle'
   ).forEach(el=>el.remove());
   // Match the compact path: keep legacy live segments as hidden anchors so
@@ -10755,6 +11043,7 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
   });
   const liveFooter=blocks.querySelector('#liveRunStatus');
   let wrote=false;
+  const targetRenderedRows=[];
   for(const row of rows){
     const node=_anchorSceneTransparentNodeForRow(row,{
       live:true,
@@ -10763,10 +11052,33 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
       sessionId:S.session&&S.session.session_id,
     });
     if(!node) continue;
-    if(liveFooter&&liveFooter.parentElement===blocks) blocks.insertBefore(node,liveFooter);
-    else blocks.appendChild(node);
+    const key = _transparentLiveRowKey(node, activeStreamId);
+    const existing = key ? preserveByKey.get(key) : null;
+    const renderedNode = existing && _transparentLiveRowsCompatible(existing, node)
+      ? _refreshTransparentLiveRow(existing, node)
+      : node;
+    if(existing) preserveByKey.delete(key);
+    if(!renderedNode) continue;
+    targetRenderedRows.push(renderedNode);
     wrote=true;
   }
+  const transparentLiveRowAlreadyPositioned=(node, expectedNextSibling)=>!!(
+    node &&
+    node.parentElement===blocks &&
+    node.nextSibling===expectedNextSibling
+  );
+  let expectedNextSibling=(liveFooter&&liveFooter.parentElement===blocks) ? liveFooter : null;
+  for(let i=targetRenderedRows.length-1;i>=0;i--){
+    const renderedNode=targetRenderedRows[i];
+    if(transparentLiveRowAlreadyPositioned(renderedNode,expectedNextSibling)){
+      expectedNextSibling=renderedNode;
+      continue;
+    }
+    if(expectedNextSibling&&expectedNextSibling.parentElement===blocks) blocks.insertBefore(renderedNode,expectedNextSibling);
+    else blocks.appendChild(renderedNode);
+    expectedNextSibling=renderedNode;
+  }
+  preserveByKey.forEach(stale=>stale.remove());
   if(wrote) _syncTransparentEventControls(turn);
   if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
   _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
@@ -10778,6 +11090,127 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
   }
   if(!scrollRebuildGuard.readerAwayFromBottom&&typeof scrollIfPinned==='function') scrollIfPinned();
   return wrote;
+}
+
+function _transparentLiveRowKey(node, streamId){
+  if(!node || !node.getAttribute) return '';
+  const rowId = String(node.getAttribute('data-anchor-row-id') || '').trim();
+  if(!rowId) return '';
+  const rowStreamId = String(streamId || node.getAttribute('data-anchor-stream-id') || '').trim();
+  const rowRole = String(node.getAttribute('data-anchor-row-role') || 'activity').trim();
+  const rowSource = String(node.getAttribute('data-anchor-source-event-type') || '').trim();
+  return `${rowStreamId}\u0000${rowId}\u0000${rowRole}\u0000${rowSource}`;
+}
+
+function _transparentLiveRowsCompatible(existing, candidate){
+  if(!existing || !candidate) return false;
+  return !!(
+    existing.getAttribute('data-anchor-row-id') === candidate.getAttribute('data-anchor-row-id') &&
+    existing.getAttribute('data-anchor-row-role') === candidate.getAttribute('data-anchor-row-role') &&
+    existing.getAttribute('data-anchor-source-event-type') === candidate.getAttribute('data-anchor-source-event-type')
+  );
+}
+
+function _transparentLiveRowAttributePairs(node){
+  if(!node) return [];
+  if(typeof node.getAttributeNames === 'function'){
+    return node.getAttributeNames().map(name=>[name, node.getAttribute(name)]);
+  }
+  const attrs = node.attributes;
+  if(!attrs || typeof attrs !== 'object') return [];
+  if(typeof attrs.length === 'number'){
+    const pairs = [];
+    for(let i=0;i<attrs.length;i++){
+      const attr = typeof attrs.item === 'function' ? attrs.item(i) : attrs[i];
+      if(!attr || !attr.name) continue;
+      pairs.push([attr.name, attr.value]);
+    }
+    return pairs;
+  }
+  return Object.keys(attrs).map(name=>[name, attrs[name]]);
+}
+
+function _transparentLiveRowInteractiveState(row){
+  const card = row&&row.querySelector ? row.querySelector('.tool-card,.thinking-card') : null;
+  const detail = row&&row.querySelector ? row.querySelector('.tool-card-detail') : null;
+  return {
+    expanded: !!((card&&card.classList&&card.classList.contains('open')) || (row&&row.getAttribute&&row.getAttribute('data-expanded')==='1')),
+    detailMode: detail&&detail.getAttribute ? String(detail.getAttribute('data-transparent-detail-mode') || '') : '',
+  };
+}
+
+function _rehydrateTransparentLiveRow(existing, node, preservedState){
+  if(!existing) return;
+  if(node && Object.prototype.hasOwnProperty.call(node, '_tcData')) existing._tcData = node._tcData;
+  else if(Object.prototype.hasOwnProperty.call(existing, '_tcData')) delete existing._tcData;
+  try{ delete node._tcData; }catch(_){}
+  const header = existing.querySelector ? existing.querySelector('.tool-card-header,.thinking-card-header') : null;
+  if(header){
+    if(typeof _wireTransparentHeaderToggle === 'function') _wireTransparentHeaderToggle(header);
+    if(typeof _attachCopyButton === 'function') _attachCopyButton(header);
+  }
+  const card = existing.querySelector ? existing.querySelector('.tool-card,.thinking-card') : null;
+  if(card){
+    if(typeof _setTransparentCardOpen === 'function') _setTransparentCardOpen(card, !!(preservedState&&preservedState.expanded));
+    else if(card.classList&&typeof card.classList.toggle === 'function') card.classList.toggle('open', !!(preservedState&&preservedState.expanded));
+  }
+  const detail = existing.querySelector ? existing.querySelector('.tool-card-detail') : null;
+  if(detail && preservedState && preservedState.detailMode){
+    detail.setAttribute('data-transparent-detail-mode', preservedState.detailMode);
+    detail.querySelectorAll('.transparent-detail-mode').forEach(el=>{
+      const mode = String(el.getAttribute('data-mode') || '');
+      if(el.classList && typeof el.classList.toggle === 'function') el.classList.toggle('active', mode===preservedState.detailMode);
+    });
+  }
+}
+
+function _refreshTransparentThinkingLiveRow(existing, node){
+  if(!existing || !node || !existing.querySelector || !node.querySelector) return false;
+  const existingType = String(existing.getAttribute('data-event-type') || '');
+  const nodeType = String(node.getAttribute('data-event-type') || '');
+  const existingIsThinking = existingType === 'thinking' || (existing.classList&&existing.classList.contains('transparent-thinking-event'));
+  const nodeIsThinking = nodeType === 'thinking' || (node.classList&&node.classList.contains('transparent-thinking-event'));
+  if(!existingIsThinking || !nodeIsThinking) return false;
+  const existingPre = existing.querySelector('.thinking-card-body pre');
+  const nodePre = node.querySelector('.thinking-card-body pre');
+  if(!existingPre || !nodePre) return false;
+  const nextText = String(nodePre.textContent || '');
+  if(existingPre.textContent !== nextText) existingPre.textContent = nextText;
+  const nodePreview = node.querySelector('.transparent-event-thinking-preview');
+  const previewText = nodePreview ? String(nodePreview.textContent || '') : nextText;
+  if(typeof _decorateTransparentEventRow === 'function'){
+    _decorateTransparentEventRow(existing,{type:'thinking',text:nextText,preview:previewText});
+  }
+  return true;
+}
+
+function _refreshTransparentLiveRow(existing, node){
+  if(!existing || !node || !existing.getAttribute) return node;
+  if(existing===node) return existing;
+  const preservedState = _transparentLiveRowInteractiveState(existing);
+  const pairs = _transparentLiveRowAttributePairs(node);
+  const kept = Object.create(null);
+  for(const pair of pairs){
+    const [name, value] = pair;
+    kept[String(name)] = String(value ?? '');
+  }
+  for(const [name] of _transparentLiveRowAttributePairs(existing)){
+    if(!Object.prototype.hasOwnProperty.call(kept, name)) existing.removeAttribute(name);
+  }
+  for(const pair of pairs){
+    const [name, value] = pair;
+    existing.setAttribute(name, value);
+  }
+  existing.className = node.className || '';
+  if(_refreshTransparentThinkingLiveRow(existing, node)){
+    _rehydrateTransparentLiveRow(existing, node, preservedState);
+    return existing;
+  }
+  const newHtml = node.innerHTML || '';
+  const htmlChanged = existing.innerHTML !== newHtml;
+  if(htmlChanged) existing.innerHTML = newHtml;
+  _rehydrateTransparentLiveRow(existing, node, preservedState);
+  return existing;
 }
 function _renderLiveAnchorActivitySceneForStream(streamId, sessionId, opts){
   const mode=(typeof isTransparentStream==='function'&&isTransparentStream())
@@ -12181,15 +12614,133 @@ function _restoreMessageScrollSnapshot(snapshot){
  * Chromium cannot re-anchor to the topmost row during the innerHTML=''
  * wipe-and-rebuild gap. The rAF callback restores CSS default afterward.
  */
+// Mobile scroll jump-back root fix. On touch devices #messages rests at
+// overflow-anchor:auto, so the browser's native scroll-anchoring engine
+// re-compensates scrollTop in the LAYOUT phase whenever content above the
+// viewport changes height — worklog live→settled collapse, tool-card inserts,
+// media/katex reflow, virtual-scroll topPad recompute, the STREAM_DONE
+// multi-render sequence. That compensation happens in the browser's layout step,
+// INDEPENDENT of which frame our JS wrote scrollTop in, so per-write suppression
+// (a single-rAF guard) could not reach it: the collapse/reflow lands a frame or
+// two later, after the guard already released. Real mobile flight-recorder data
+// (captured jumps with dTop -101/+350/+748/-400, call stack = rAF sampler only =
+// NO JS frame) confirmed the compensation is the browser engine, not our scroll
+// writes.
+//
+// Fix: DEFER the restore AND track CSS animations. Each call re-arms suppression
+// and cancels any pending release, so a burst of renders (STREAM_DONE fires
+// several back-to-back) shares ONE suppression window. The base window is two
+// animation frames + a settle timeout, which covers churn that is NOT a CSS
+// animation (virtual topPad recompute, image-decode, katex measure). But the
+// dominant churn is CSS max-height collapse/expand animations on worklog rows —
+// .activity-body (.34s), .tool-group-body (.3s), .tool-card-detail (.26s) — which
+// run LONGER than a fixed window; a fixed window lifts mid-animation and the rest
+// of the animation still jumps. So we also bind transitionrun/transitionend on
+// #messages: an animation start holds suppression (cancels the pending release);
+// an animation end schedules a short settle after the LAST one. Hard-capped so a
+// looping transition can't pin overflow-anchor:none forever. Desktop rests at
+// none (predicate false) → the whole guard is a no-op.
+const _MOBILE_ANCHOR_BASE_SETTLE_MS=400;
+const _MOBILE_ANCHOR_POST_TRANSITION_MS=90;
+const _MOBILE_ANCHOR_MAX_HOLD_MS=1200;
+let _mobileAnchorSuppressReleaseTimer=null;
+let _mobileAnchorSuppressRafId=0;
+let _mobileAnchorTransitionListenerBound=false;
+let _mobileAnchorSuppressArmedAt=0;
+// Independent hard-cap timer. Unlike the settle/rAF release (which the
+// transitionrun handler CANCELS to hold across an animation), this one is NEVER
+// cancelled by re-arm or by onRun — it is only ever cleared when suppression is
+// actually lifted, and re-armed to a fresh deadline on each _fixMobileScrollJank
+// call. This guarantees overflow-anchor returns to the mobile resting 'auto'
+// even if EVERY transitionend/transitioncancel is missed (animation interrupted,
+// element detached mid-transition, etc.) — the #5338 contract that mobile rests
+// at 'auto' must hold no matter what. (Gate-cert defect: the previous
+// _MOBILE_ANCHOR_MAX_HOLD_MS was only a guard clause inside onRun, so a missed
+// transitionend pinned 'none' forever.)
+let _mobileAnchorMaxHoldTimer=null;
+function _liftMobileAnchorSuppression(el){
+  if(_mobileAnchorSuppressReleaseTimer){ clearTimeout(_mobileAnchorSuppressReleaseTimer); _mobileAnchorSuppressReleaseTimer=null; }
+  if(_mobileAnchorMaxHoldTimer){ clearTimeout(_mobileAnchorMaxHoldTimer); _mobileAnchorMaxHoldTimer=null; }
+  if(_mobileAnchorSuppressRafId&&typeof cancelAnimationFrame==='function'){ cancelAnimationFrame(_mobileAnchorSuppressRafId); }
+  _mobileAnchorSuppressRafId=0;
+  // Only clear the inline value we set; a concurrent path may have legitimately
+  // re-armed it (checked via the 'none' guard).
+  if(el&&el.style&&el.style.overflowAnchor==='none') el.style.overflowAnchor='';
+}
+function _bindMobileAnchorTransitionExtender(el){
+  if(_mobileAnchorTransitionListenerBound||!el||!el.addEventListener) return;
+  _mobileAnchorTransitionListenerBound=true;
+  // Only act while suppression is actually armed (inline 'none') and within the
+  // hard cap, so we never pin overflow-anchor:none indefinitely.
+  const onRun=(e)=>{
+    if(!e||e.propertyName!=='max-height') return;
+    if(el.style.overflowAnchor!=='none') return;
+    if(_mobileAnchorSuppressArmedAt && (performance.now()-_mobileAnchorSuppressArmedAt)>_MOBILE_ANCHOR_MAX_HOLD_MS) return;
+    // An animation is running — cancel the pending SETTLE release so we stay
+    // suppressed until it ends (transitionend re-schedules the settle). The
+    // independent max-hold timer is deliberately NOT cancelled here.
+    if(_mobileAnchorSuppressReleaseTimer){ clearTimeout(_mobileAnchorSuppressReleaseTimer); _mobileAnchorSuppressReleaseTimer=null; }
+    if(_mobileAnchorSuppressRafId&&typeof cancelAnimationFrame==='function'){ cancelAnimationFrame(_mobileAnchorSuppressRafId); }
+    _mobileAnchorSuppressRafId=0;
+  };
+  const onEnd=(e)=>{
+    if(!e||e.propertyName!=='max-height') return;
+    if(el.style.overflowAnchor!=='none') return;
+    // This animation ended; settle shortly after (another may still be running,
+    // in which case its own transitionrun already cancelled this timer).
+    if(_mobileAnchorSuppressReleaseTimer){ clearTimeout(_mobileAnchorSuppressReleaseTimer); }
+    _mobileAnchorSuppressReleaseTimer=setTimeout(()=>{
+      _mobileAnchorSuppressReleaseTimer=null;
+      _liftMobileAnchorSuppression(el);
+    },_MOBILE_ANCHOR_POST_TRANSITION_MS);
+  };
+  el.addEventListener('transitionrun',onRun,{passive:true});
+  el.addEventListener('transitionstart',onRun,{passive:true});
+  el.addEventListener('transitionend',onEnd,{passive:true});
+  el.addEventListener('transitioncancel',onEnd,{passive:true});
+}
 window._fixMobileScrollJank=function _fixMobileScrollJank(){
   const el=document.getElementById('messages');
   if(!el) return;
-  // Desktop with a mouse: keep overflow-anchor:none (explicitly set by CSS).
-  // Mobile touch devices only: temporarily suppress anchor re-selection.
-  if(window.matchMedia('(hover:hover) and (pointer:fine)').matches) return;
+  // Engage when the browser scroll-anchor layer is active (mobile auto), OR when
+  // WE are already holding an inline suppression from a prior call in the same
+  // burst. The predicate reads the COMPUTED value, which our own inline
+  // overflow-anchor:none flips to 'none' — so on the 2nd..Nth call of a
+  // STREAM_DONE burst the predicate would say false and short-circuit the re-arm
+  // below, collapsing the whole "consecutive renders extend the window" behavior
+  // to a single first-call window. Treat an inline 'none' WE set as still-armed
+  // so re-arm actually runs. Desktop rests at computed 'none' with EMPTY inline,
+  // so `alreadySuppressed` is false there and this stays a no-op. (Gate-cert
+  // defect: re-arm was dead code without this.)
+  const alreadySuppressed=el.style.overflowAnchor==='none';
+  if(!alreadySuppressed && !_browserOverflowAnchorActive(el)) return;
   el.style.overflowAnchor='none';
-  requestAnimationFrame(()=>{
-    if(el.style.overflowAnchor==='none') el.style.overflowAnchor='';
+  _bindMobileAnchorTransitionExtender(el);
+  _mobileAnchorSuppressArmedAt=performance.now();
+  // Re-arm: cancel any pending release so consecutive renders EXTEND, not shorten,
+  // the suppression window (the STREAM_DONE settle fires renderMessages several
+  // times back-to-back, plus a deferred postProcess reflow).
+  if(_mobileAnchorSuppressReleaseTimer){ clearTimeout(_mobileAnchorSuppressReleaseTimer); _mobileAnchorSuppressReleaseTimer=null; }
+  if(_mobileAnchorSuppressRafId&&typeof cancelAnimationFrame==='function'){ cancelAnimationFrame(_mobileAnchorSuppressRafId); }
+  _mobileAnchorSuppressRafId=0;
+  // Independent hard cap: (re)arm a release that NOTHING cancels except an actual
+  // lift, so a missed transitionend can never pin 'none' past the cap.
+  if(_mobileAnchorMaxHoldTimer){ clearTimeout(_mobileAnchorMaxHoldTimer); }
+  _mobileAnchorMaxHoldTimer=setTimeout(()=>{
+    _mobileAnchorMaxHoldTimer=null;
+    _liftMobileAnchorSuppression(el);
+  },_MOBILE_ANCHOR_MAX_HOLD_MS);
+  const rafHop=(cb)=>{ if(typeof requestAnimationFrame==='function') return requestAnimationFrame(cb); return setTimeout(cb,16); };
+  // Base window: two animation frames (paint + post-render reflow settle) THEN a
+  // settle timeout. CSS max-height animations are covered by the transitionrun/
+  // transitionend extender above; this floor covers non-animated churn.
+  _mobileAnchorSuppressRafId=rafHop(()=>{
+    _mobileAnchorSuppressRafId=rafHop(()=>{
+      _mobileAnchorSuppressReleaseTimer=setTimeout(()=>{
+        _mobileAnchorSuppressReleaseTimer=null;
+        _liftMobileAnchorSuppression(el);
+      },_MOBILE_ANCHOR_BASE_SETTLE_MS);
+    });
   });
 };
 
@@ -12475,7 +13026,7 @@ function renderMessages(options){
       _scrollAfterMessageRender(preserveScroll, scrollSnapshot);
       if(_maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualWindow)) return;
       _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);
-      requestAnimationFrame(()=>postProcessRenderedMessages(inner));
+      requestAnimationFrame(()=>_postProcessWithAnchorSuppression(inner));
       if(typeof _initMediaPlaybackObserver==='function') _initMediaPlaybackObserver();
       if(typeof loadTodos==='function'&&document.getElementById('panelTodos')&&document.getElementById('panelTodos').classList.contains('active')){loadTodos();}
       return;
@@ -12495,7 +13046,24 @@ function renderMessages(options){
   if(sid&&INFLIGHT[sid]){
     const _lt=document.getElementById('liveAssistantTurn');
     if(_lt&&(!_lt.dataset||!_lt.dataset.sessionId||_lt.dataset.sessionId===sid)){
-      _preservedLiveTurn=_lt;
+      // Blank-turn fix (对话消失): only preserve the live turn across the DOM
+      // wipe if it is GENUINELY live — either an active stream is still running
+      // (S.activeStreamId set: the #3877 mid-stream flicker case this preserve
+      // was written for), or the turn already holds real rendered content (a
+      // visible answer body, a tool card, or a reasoning row). A DEAD shell —
+      // an interrupted turn whose stream dropped (S.activeStreamId cleared to
+      // null) but whose INFLIGHT[sid] entry was not cleaned, leaving only an
+      // empty worklog group ("Processed Ns" with no body/tool rows) — must NOT
+      // be preserved: re-attaching it on a session-updated swap re-render pins
+      // an avatar-only empty turn OVER the settled transcript, hiding the real
+      // (already-persisted) answer. That is the reported blank. Reproduced +
+      // fix verified on an isolated debug instance (8710): stale INFLIGHT +
+      // empty live-turn survived the swap → blank; gating on real-content /
+      // active-stream clears it while a genuine live turn still renders.
+      const _hasRealLiveContent=!!_lt.querySelector('.msg-body, .tool-card-row, .wl-reason');
+      if(_hasRealLiveContent || S.activeStreamId){
+        _preservedLiveTurn=_lt;
+      }
     }
   }
   const compressionState=(()=>{
@@ -12828,7 +13396,10 @@ function renderMessages(options){
     const undoBtn  = isLastAssistant ? `<button class="msg-action-btn" title="${t('undo_exchange')}" onclick="undoLastExchange()">${li('undo',13)}</button>` : '';
     const retryBtn = isLastAssistant ? `<button class="msg-action-btn" title="${t('regenerate')}" onclick="regenerateResponse(this)">${li('rotate-ccw',13)}</button>` : '';
     const copyBtn  = `<button class="msg-copy-btn msg-action-btn" title="${t('copy')}" onclick="copyMsg(this)">${li('copy',13)}</button>`;
-    const forkBtn  = `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1})">${li('git-branch',13)}</button>`;
+    const readOnlySession=typeof _isReadOnlySession==='function'
+      ? _isReadOnlySession(S.session)
+      : !!(S.session&&(S.session.read_only||S.session.is_read_only));
+    const forkBtn  = readOnlySession ? '' : `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1})">${li('git-branch',13)}</button>`;
     const ttsBtn   = !isUser ? `<button class="msg-action-btn msg-tts-btn" title="${t('tts_listen')||'Listen'}" onclick="speakMessage(this)">${li('volume-2',13)}</button>` : '';
     const tsVal=m._ts||m.timestamp;
     // _formatInServerTz handles fractional-hour offsets (India +0530 etc.)
@@ -13829,7 +14400,7 @@ function renderMessages(options){
   _scrollAfterMessageRender(preserveScroll, scrollSnapshot);
   if(_maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualWindow)) return;
   // Apply syntax highlighting after DOM is built
-  requestAnimationFrame(()=>postProcessRenderedMessages(inner));
+  requestAnimationFrame(()=>_postProcessWithAnchorSuppression(inner));
   // Refresh todo panel if it's currently open
   if(typeof loadTodos==='function' && document.getElementById('panelTodos') && document.getElementById('panelTodos').classList.contains('active')){
     loadTodos();
@@ -14955,6 +15526,36 @@ async function regenerateResponse(btn) {
   } catch(e) { setStatus(t('regen_failed') + e.message); }
 }
 
+// postProcessRenderedMessages() runs one frame AFTER the render + JS scroll
+// restore (it is scheduled via requestAnimationFrame). It performs syntax
+// highlighting, inline diff/csv/pdf/html/excalidraw hydration, mermaid/katex
+// rendering — all of which can CHANGE the height of rows above the viewport.
+//
+// On mobile the scroller rests at overflow-anchor:auto, so any above-viewport
+// height change in this post-render frame makes the browser's native anchor
+// engine compensate scrollTop a SECOND time — after the JS restore already
+// settled the reader's position — yanking them to an unrelated turn ("往回大跳").
+// The synchronous _fixMobileScrollJank / _suppressBrowserOverflowAnchor guards
+// only cover the render frame itself; they have already released by the time
+// this rAF fires. Wrap the post-process (and the media-reflow frame right after
+// it) in the same suppression so the browser layer cannot re-anchor during the
+// async settle window. Desktop rests at `none`, so this is a no-op there.
+function _postProcessWithAnchorSuppression(container){
+  const scroller=$('messages');
+  const release=(scroller&&typeof _suppressBrowserOverflowAnchor==='function')
+    ? _suppressBrowserOverflowAnchor(scroller) : null;
+  try{
+    postProcessRenderedMessages(container);
+  }finally{
+    // Hold suppression across ONE more frame so late media/layout reflow
+    // (image decode, katex/mermaid measure) cannot re-anchor either, then let
+    // _suppressBrowserOverflowAnchor's own rAF-deferred restore run.
+    if(release){
+      if(typeof requestAnimationFrame==='function') requestAnimationFrame(release);
+      else release();
+    }
+  }
+}
 function postProcessRenderedMessages(container) {
   highlightCode(container);
   addCopyButtons(container);
