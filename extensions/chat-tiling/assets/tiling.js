@@ -223,10 +223,8 @@ function initCapture(){
     window.registerHermesSessionOpenHandler(function(sid, data, opts){
       if(!T.visible) return {};
       if(opts&&opts.loaded&&sid){
-        // Find a free tile and fill it with this session's data
         const t=T.tiles.find(t=>!t.sid);
         if(t&&data){
-          // Don't open the same session in two tiles
           if(T.tiles.some(x=>x.sid===sid&&x!==t)) return {};
           t.sid=sid;t.session=data;t.messages=(data.messages)||[];t.cv='';t.mv=null;
           updateHeader(t);badge(sid,1);renderMsgs(t);focusTile(t.id);
@@ -237,21 +235,39 @@ function initCapture(){
     });
     return;
   }
-  // Fallback: MutationObserver-based sidebar interception for older core
+  // Fallback: MutationObserver-based sidebar interception for older core.
+  // Supports bothHistorical DOM shapes:
+  //   - `.session-list#sessionList .session-item[data-sid]` (current)
+  //   - `#sessionSidebar [data-session-id]` (legacy)
   const obs=new MutationObserver(()=>{
-    const s=document.getElementById('sessionSidebar')||document.querySelector('.sidebar-session-list');
-    if(s&&!s.dataset.extTilingWired){s.dataset.extTilingWired='1';s.addEventListener('click',onSidebarClick,true)}
-  });obs.observe(document.body,{childList:true,subtree:true});
+    if(document.querySelector('.ext-tile-sidebar-badge')) return;
+    const list=document.getElementById('sessionList')||document.querySelector('.session-list')||document.getElementById('sessionSidebar')||document.querySelector('.sidebar-session-list');
+    if(list&&!list.dataset.extTilingWired){
+      list.dataset.extTilingWired='1';
+      list.addEventListener('click',onSidebarClick,true);
+      const badge=document.createElement('div');badge.className='ext-tile-sidebar-badge';badge.textContent='✓ tiling';badge.style.cssText='position:absolute;bottom:6px;right:6px;background:#22c55e;color:#fff;font-size:9px;padding:1px 5px;border-radius:4px;pointer-events:none;z-index:5';
+      list.style.position='relative';list.appendChild(badge);
+    }
+  });
+  obs.observe(document.body,{childList:true,subtree:true});
   setTimeout(()=>{
-    const s=document.getElementById('sessionSidebar')||document.querySelector('.sidebar-session-list');
-    if(s&&!s.dataset.extTilingWired){s.dataset.extTilingWired='1';s.addEventListener('click',onSidebarClick,true)}
+    if(document.querySelector('.ext-tile-sidebar-badge')) return;
+    const list=document.getElementById('sessionList')||document.querySelector('.session-list')||document.getElementById('sessionSidebar')||document.querySelector('.sidebar-session-list');
+    if(list&&!list.dataset.extTilingWired){
+      list.dataset.extTilingWired='1';
+      list.addEventListener('click',onSidebarClick,true);
+      const badge=document.createElement('div');badge.className='ext-tile-sidebar-badge';badge.textContent='✓ tiling';badge.style.cssText='position:absolute;bottom:6px;right:6px;background:#22c55e;color:#fff;font-size:9px;padding:1px 5px;border-radius:4px;pointer-events:none;z-index:5';
+      list.style.position='relative';list.appendChild(badge);
+    }
   },1e3)
 }
 
 function onSidebarClick(e){
-  if(!T.visible)return;
-  const row=e.target.closest('[data-session-id]');if(!row)return;
-  const sid=row.dataset.sessionId;if(!sid)return;
+  if(!T.visible) return;
+  const row=e.target.closest('.session-item[data-sid]')||e.target.closest('[data-session-id]');
+  if(!row) return;
+  const sid=row.dataset.sid||row.dataset.sessionId;
+  if(!sid) return;
   e.stopPropagation();e.preventDefault();
   (async()=>{try{openTile(sid,await window.api(`/api/session?session_id=${encodeURIComponent(sid)}&resolve_model=0`))}catch(_){typeof showToast=='function'&&showToast('Failed to load session',3e3,'error')}})()
 }
