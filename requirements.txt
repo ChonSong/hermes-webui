@@ -16,3 +16,7 @@ cryptography>=42.0
 # The workspace file routes return 503 with an install hint when they are absent.
 # Install them only if you want .docx/.xlsx/.pptx preview support:
 #   pip install python-docx>=1.1.2 openpyxl>=3.1.5 python-pptx>=1.0.2
+# OPTIONAL: TOTP multi-factor authentication (MFA) needs these packages.
+# The /api/auth/mfa/* endpoints return 503 when they are absent.
+# Install them only if you want Google Authenticator-compatible 2FA:
+#   pip install pyotp>=2.10 qrcode[pil]>=8.0

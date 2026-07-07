@@ -51,6 +51,7 @@ def _resolve_session_ttl() -> int:
 PUBLIC_PATHS = frozenset({
     '/login', '/health', '/favicon.ico', '/sw.js',
     '/api/auth/login', '/api/auth/status',
+    '/api/auth/mfa/verify', '/api/auth/mfa/status',
     '/api/auth/oidc/start', '/api/auth/oidc/callback',
     '/api/auth/passkey/options', '/api/auth/passkey/login',
     '/manifest.json', '/manifest.webmanifest',
@@ -498,6 +499,15 @@ def get_oidc_startup_warning() -> str | None:
     )
 
 
+def is_mfa_enabled() -> bool:
+    """True if TOTP multi-factor authentication is enabled."""
+    try:
+        from api.auth_mfa import is_mfa_enabled as _check_mfa
+        return _check_mfa()
+    except Exception:
+        return False
+
+
 def is_auth_enabled() -> bool:
     """True if password auth, passkeys, or OIDC login is configured."""
     return (
@@ -691,7 +701,7 @@ def check_auth(handler, parsed) -> bool:
     if not is_auth_enabled():
         return True
     # Public paths don't require auth
-    if parsed.path in PUBLIC_PATHS or parsed.path.startswith('/static/') or parsed.path.startswith('/session/static/'):
+    if parsed.path in PUBLIC_PATHS or parsed.path.startswith('/static/') or parsed.path.startswith('/session/static/') or parsed.path.startswith('/extensions/'):
         return True
     # Check session cookie
     cookie_val = parse_cookie(handler)

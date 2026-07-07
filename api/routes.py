@@ -5131,6 +5131,8 @@ def _csrf_exempt_path(path: str) -> bool:
     """Paths that cannot or must not carry a session CSRF token."""
     return path in {
         "/api/auth/login",
+        "/api/auth/mfa/verify",
+        "/api/auth/mfa/status",
         "/api/auth/passkey/options",
         "/api/auth/passkey/login",
         "/api/csp-report",
@@ -9200,30 +9202,45 @@ input{width:100%;padding:10px 14px;border-radius:10px;border:1px solid rgba(255,
   background:rgba(255,255,255,.04);color:#e8e8f0;font-size:14px;outline:none;margin-bottom:14px;
   transition:border-color .15s}
 input:focus{border-color:rgba(124,185,255,.5);box-shadow:0 0 0 3px rgba(124,185,255,.1)}
+input:disabled{opacity:.5;cursor:not-allowed}
 button{width:100%;padding:10px;border-radius:10px;border:none;background:rgba(124,185,255,.15);
   border:1px solid rgba(124,185,255,.3);color:#7cb9ff;font-size:14px;font-weight:600;cursor:pointer;
   transition:all .15s}
 button:hover{background:rgba(124,185,255,.25)}
+button:disabled{opacity:.5;cursor:not-allowed}
 .oidc-login{display:block;margin-top:10px;padding:10px;border-radius:10px;text-decoration:none;
   background:rgba(255,255,255,.04);border:1px solid rgba(111,214,164,.35);color:#6fd6a4;
   font-size:14px;font-weight:600;cursor:pointer;transition:all .15s}
 .oidc-login:hover{background:rgba(111,214,164,.12)}
 .passkey-login{margin-top:10px;background:rgba(255,255,255,.04);border-color:rgba(232,160,48,.35);color:#e8a030}
 .err{color:#e94560;font-size:12px;margin-top:10px;display:none}
+/* MFA step */
+.step{margin-top:24px;font-size:13px;color:#aaaacc}
+.step-mfa-input{letter-spacing:6px;font-size:20px;text-align:center;font-weight:600}
 </style></head><body>
 <div class="card">
   <div class="logo">{{BOT_NAME_INITIAL}}</div>
   <h1>{{BOT_NAME}}</h1>
-  <p class="sub">{{LOGIN_SUBTITLE}}</p>
+  <p class="sub" id="page-subtitle">{{LOGIN_SUBTITLE}}</p>
   <form id="login-form" data-invalid-pw="{{LOGIN_INVALID_PW}}" data-conn-failed="{{LOGIN_CONN_FAILED}}">
-    <input type="password" id="pw" placeholder="{{LOGIN_PLACEHOLDER}}" autofocus>
-    <button type="submit">{{LOGIN_BTN}}</button>
-    <button type="button" id="passkey-login" class="passkey-login" style="display:none">Sign in with passkey</button>
-    {{OIDC_LOGIN_HTML}}
+    <!-- Step 1: Password -->
+    <div id="step-password">
+      <input type="password" id="pw" placeholder="{{LOGIN_PLACEHOLDER}}" autofocus>
+      <button type="submit">{{LOGIN_BTN}}</button>
+      <button type="button" id="passkey-login" class="passkey-login" style="display:none">Sign in with passkey</button>
+      {{OIDC_LOGIN_HTML}}
+    </div>
+    <!-- Step 2: TOTP (hidden, shown after password verification) -->
+    <div id="step-mfa" style="display:none">
+      <p class="step">Enter the 6-digit code from your authenticator app</p>
+      <input type="text" id="mfa-code" class="step-mfa-input" placeholder="000000" maxlength="6" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code">
+      <input type="hidden" id="mfa-token" value="">
+      <button type="button" id="mfa-verify-btn">Verify</button>
+      <button type="button" id="mfa-back-btn" style="margin-top:8px;background:transparent;border:none;color:#8888aa;font-size:12px">← Back</button>
+    </div>
   </form>
   <div class="err" id="err"></div>
 </div>
-<!-- Keep login.js relative so subpath mounts load it under the current scope. -->
 <script src="static/login.js?v={{WEBUI_VERSION}}"></script>
 </body></html>"""
 
@@ -11227,6 +11244,36 @@ def handle_get(handler, parsed) -> bool:
             "passkeys_count": len(passkeys),
             "passkey_feature_flag": passkey_flag,
             "auth_disabled_acknowledged": bool(load_settings().get("auth_disabled_acknowledged")) if not auth_enabled else False,
+        })
+
+    if parsed.path == "/api/auth/mfa/status":
+        from api.auth import is_auth_enabled as _auth_enabled_check
+        from api.auth_mfa import is_mfa_enabled as _mfa_check
+
+        return j(handler, {
+            "mfa_enabled": _mfa_check(),
+            "auth_enabled": _auth_enabled_check(),
+        })
+
+    if parsed.path == "/api/auth/mfa/setup":
+        from api.auth import parse_cookie, verify_session
+        from api.auth_mfa import (
+            generate_totp_secret,
+            provisioning_uri,
+            generate_qr_code_data_url,
+        )
+
+        cv = parse_cookie(handler)
+        if not cv or not verify_session(cv):
+            return bad(handler, "Authentication required", 401)
+
+        secret = generate_totp_secret()
+        uri = provisioning_uri(secret)
+        qr_data_url = generate_qr_code_data_url(uri)
+        return j(handler, {
+            "secret": secret,
+            "provisioning_uri": uri,
+            "qr_code_data_url": qr_data_url,
         })
 
     if parsed.path in ("/manifest.json", "/manifest.webmanifest"):
@@ -14989,6 +15036,18 @@ def handle_post(handler, parsed) -> bool:
         if not verify_password(password):
             _record_login_attempt(client_ip)
             return bad(handler, "Invalid password", 401)
+
+        # ── MFA check ────────────────────────────────────────────────
+        from api.auth_mfa import is_mfa_enabled as _mfa_check, create_mfa_temp_token
+        if _mfa_check():
+            # Step 1 complete — require TOTP code before issuing session
+            mfa_token = create_mfa_temp_token(client_ip)
+            return j(handler, {
+                "ok": True,
+                "mfa_required": True,
+                "mfa_token": mfa_token,
+            })
+
         _clear_login_attempts(client_ip)
         cookie_val = create_session()
         body = json.dumps({"ok": True}).encode()
@@ -15043,6 +15102,91 @@ def handle_post(handler, parsed) -> bool:
         handler.end_headers()
         handler.wfile.write(json.dumps({"ok": True}).encode())
         return True
+
+    if parsed.path == "/api/auth/mfa/verify":
+        from api.auth_mfa import (
+            verify_mfa_temp_token,
+            verify_totp_code,
+        )
+        from api.auth import (
+            create_session,
+            set_auth_cookie,
+            _check_login_rate,
+            _record_login_attempt,
+            _clear_login_attempts,
+            is_auth_enabled,
+        )
+
+        if not is_auth_enabled():
+            return j(handler, {"ok": True, "message": "Auth not enabled"})
+        client_ip = handler.client_address[0]
+        if not _check_login_rate(client_ip):
+            return j(handler, {"error": "Too many attempts. Try again in a minute."}, status=429)
+
+        mfa_token = (body or {}).get("mfa_token", "")
+        code = (body or {}).get("code", "")
+        if not mfa_token or not code:
+            return bad(handler, "mfa_token and code are required", 400)
+
+        if not verify_mfa_temp_token(mfa_token, client_ip):
+            return bad(handler, "MFA session expired or invalid. Please log in again.", 401)
+
+        if not verify_totp_code(code):
+            _record_login_attempt(client_ip)
+            return bad(handler, "Invalid verification code", 401)
+
+        _clear_login_attempts(client_ip)
+        cookie_val = create_session()
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Cache-Control", "no-store")
+        _security_headers(handler)
+        set_auth_cookie(handler, cookie_val)
+        handler.end_headers()
+        handler.wfile.write(json.dumps({"ok": True}).encode())
+        return True
+
+    if parsed.path == "/api/auth/mfa/enable":
+        from api.auth import parse_cookie, verify_session, verify_password
+
+        cv = parse_cookie(handler)
+        if not cv or not verify_session(cv):
+            return bad(handler, "Authentication required", 401)
+
+        from api.auth_mfa import (
+            enable_mfa,
+            verify_totp_code,
+        )
+
+        secret = (body or {}).get("secret", "")
+        code = (body or {}).get("code", "")
+
+        # Require the user to prove they have the TOTP secret in their
+        # authenticator app by submitting a valid code *before* we persist it.
+        if not secret or not code:
+            return bad(handler, "secret and code are required", 400)
+
+        if not verify_totp_code_for_secret(secret, code):
+            return bad(handler, "Invalid verification code. Make sure your authenticator app is set up correctly.", 400)
+
+        enable_mfa(secret)
+        return j(handler, {"ok": True})
+
+    if parsed.path == "/api/auth/mfa/disable":
+        from api.auth import parse_cookie, verify_session, verify_password
+
+        cv = parse_cookie(handler)
+        if not cv or not verify_session(cv):
+            return bad(handler, "Authentication required", 401)
+
+        password = (body or {}).get("password", "")
+        if not verify_password(password):
+            return bad(handler, "Invalid password", 401)
+
+        from api.auth_mfa import disable_mfa
+
+        disable_mfa()
+        return j(handler, {"ok": True})
 
     if parsed.path == "/api/auth/passkey/register/options":
         from api.auth import _passkey_feature_flag_enabled

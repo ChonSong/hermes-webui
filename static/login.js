@@ -1,11 +1,22 @@
 /* Login page — external script, no inline handlers.
  * Loaded by the /login route. Reads data attributes from the form for
  * i18n strings so the server does not need to inject JS literals.
+ *
+ * v2 — TOTP multi-factor authentication support.
+ * When password auth is verified and the server returns mfa_required,
+ * the page transitions to a second step asking for a 6-digit TOTP code.
  */
 document.addEventListener('DOMContentLoaded', function () {
   var form = document.getElementById('login-form');
   var input = document.getElementById('pw');
   var passkeyBtn = document.getElementById('passkey-login');
+  var stepPassword = document.getElementById('step-password');
+  var stepMfa = document.getElementById('step-mfa');
+  var mfaCodeInput = document.getElementById('mfa-code');
+  var mfaTokenInput = document.getElementById('mfa-token');
+  var mfaVerifyBtn = document.getElementById('mfa-verify-btn');
+  var mfaBackBtn = document.getElementById('mfa-back-btn');
+  var subtitle = document.getElementById('page-subtitle');
 
   if (!form || !input) return;
 
@@ -36,6 +47,32 @@ document.addEventListener('DOMContentLoaded', function () {
     } catch (_) { return './'; }
   }
 
+  function redirectAfterLogin() {
+    window.location.href = _safeNextPath();
+  }
+
+  // ── TOTP MFA: transition to code-entry step ──────────────────────────
+  var _mfaToken = '';
+
+  function showMfaStep(mfaToken) {
+    _mfaToken = mfaToken;
+    if (mfaTokenInput) mfaTokenInput.value = mfaToken;
+    if (stepPassword) stepPassword.style.display = 'none';
+    if (stepMfa) stepMfa.style.display = 'block';
+    if (subtitle) subtitle.textContent = 'Two-factor authentication';
+    hideErr();
+    if (mfaCodeInput) { mfaCodeInput.value = ''; mfaCodeInput.focus(); }
+  }
+
+  function showPasswordStep() {
+    _mfaToken = '';
+    if (stepMfa) stepMfa.style.display = 'none';
+    if (stepPassword) stepPassword.style.display = 'block';
+    if (subtitle) subtitle.textContent = form.getAttribute('data-conn-failed') ? '' : (subtitle.dataset.orig || subtitle.textContent);
+    if (input) input.focus();
+  }
+
+  // ── Step 1: Password login ───────────────────────────────────────────
   async function doLogin(e) {
     e.preventDefault();
     var pw = input.value;
@@ -50,7 +87,11 @@ document.addEventListener('DOMContentLoaded', function () {
       var data = {};
       try { data = await res.json(); } catch (_) {}
       if (res.ok && data.ok) {
-        window.location.href = _safeNextPath();
+        if (data.mfa_required) {
+          showMfaStep(data.mfa_token);
+        } else {
+          redirectAfterLogin();
+        }
       } else {
         showErr(data.error || invalidPw);
       }
@@ -60,6 +101,68 @@ document.addEventListener('DOMContentLoaded', function () {
   }
 
   form.addEventListener('submit', doLogin);
+
+  // ── Step 2: TOTP code verification ───────────────────────────────────
+  async function doMfaVerify() {
+    if (!mfaCodeInput) return;
+    var code = mfaCodeInput.value.trim();
+    if (!code || code.length !== 6 || !/^\d{6}$/.test(code)) {
+      showErr('Please enter a valid 6-digit code');
+      return;
+    }
+    if (mfaVerifyBtn) mfaVerifyBtn.disabled = true;
+    hideErr();
+    try {
+      var res = await fetch('api/auth/mfa/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mfa_token: _mfaToken, code: code }),
+        credentials: 'include',
+      });
+      var data = {};
+      try { data = await res.json(); } catch (_) {}
+      if (res.ok && data.ok) {
+        redirectAfterLogin();
+      } else {
+        showErr(data.error || 'Invalid verification code');
+        if (mfaCodeInput) { mfaCodeInput.value = ''; mfaCodeInput.focus(); }
+      }
+    } catch (ex) {
+      showErr(connFailed);
+    } finally {
+      if (mfaVerifyBtn) mfaVerifyBtn.disabled = false;
+    }
+  }
+
+  if (mfaVerifyBtn) mfaVerifyBtn.addEventListener('click', doMfaVerify);
+
+  // Allow Enter key on TOTP input
+  if (mfaCodeInput) {
+    mfaCodeInput.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        doMfaVerify();
+      }
+    });
+    // Auto-advance when 6 digits entered
+    mfaCodeInput.addEventListener('input', function () {
+      if (this.value.length === 6 && /^\d{6}$/.test(this.value)) {
+        doMfaVerify();
+      }
+    });
+  }
+
+  // Back button — return to password step
+  if (mfaBackBtn) {
+    mfaBackBtn.addEventListener('click', function () {
+      showPasswordStep();
+    });
+  }
+
+  // ── Passkey login ────────────────────────────────────────────────────
+
+  // store the original subtitle to restore on back
+  if (subtitle) subtitle.dataset.orig = subtitle.textContent;
 
   function b64uToBytes(s) {
     s = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
@@ -109,8 +212,14 @@ document.addEventListener('DOMContentLoaded', function () {
       });
       var data = {};
       try { data = await res.json(); } catch (_) {}
-      if (res.ok && data.ok) window.location.href = _safeNextPath();
-      else showErr(data.error || invalidPw);
+      // Passkey login may also need MFA
+      if (res.ok && data.ok) {
+        if (data.mfa_required) {
+          showMfaStep(data.mfa_token);
+        } else {
+          redirectAfterLogin();
+        }
+      } else showErr(data.error || invalidPw);
     } catch (ex) {
       showErr(ex && ex.message ? ex.message : connFailed);
     } finally {
