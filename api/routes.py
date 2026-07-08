@@ -12481,6 +12481,20 @@ def handle_get(handler, parsed) -> bool:
         data = _skills_list_from_dir(_active_skills_dir(), category=category)
         return j(handler, {"skills": data.get("skills", [])})
 
+    if parsed.path == "/api/skills/retrieve":
+        qs = parse_qs(parsed.query)
+        query = qs.get("query", [""])[0]
+        top_k = int(qs.get("top_k", ["5"])[0])
+        if not query:
+            return j(handler, {"skills": [], "hint": "Pass ?query= parameter"})
+        try:
+            from tools.skill_retrieve_tool import skill_retrieve
+            import json as _json
+            result = _json.loads(skill_retrieve(query, top_k=top_k))
+            return j(handler, result)
+        except Exception as e:
+            return j(handler, {"error": str(e)}, status=500)
+
     if parsed.path == "/api/skills/usage":
         from api.skill_usage import read_skill_usage
         raw = read_skill_usage(_active_skills_dir())
