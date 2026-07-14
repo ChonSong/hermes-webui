@@ -14477,6 +14477,9 @@ def handle_post(handler, parsed) -> bool:
             )
         return True
 
+    if parsed.path == "/api/wiki/page":
+        return _handle_wiki_page_write(handler, body)
+
     if parsed.path == "/api/session/update":
         try:
             require(body, "session_id")
@@ -16465,6 +16468,94 @@ def _handle_session_export(handler, parsed):
     handler.end_headers()
     handler.wfile.write(payload.encode("utf-8"))
     return True
+
+
+def _handle_wiki_page_write(handler, body):
+    """POST /api/wiki/page — save a session as a wiki page.
+
+    Body: {session_id, page_name, section?=concepts, mode?=create|append}.
+    Renders the session to markdown via api.wiki_capture and writes it to
+    {wiki_root}/{section}/{page_name}.md.
+
+    Responses:
+      201 {ok, path}        — created
+      200 {ok, path}         — appended
+      400 {error}            — bad input / path traversal
+      404 {error}            — session or wiki not found / not configured
+      409 {error, path}      — exists (mode=create) or not_found (mode=append)
+    """
+    try:
+        require(body, "session_id", "page_name")
+    except ValueError as exc:
+        return bad(handler, str(exc))
+
+    sid = str(body["session_id"]).strip()
+    page_name = str(body.get("page_name", "")).strip()
+    section = str(body.get("section") or "concepts").strip().lower()
+    mode = str(body.get("mode") or "create").strip().lower()
+
+    # Validate page_name: safe slug, no path traversal, no dot-files
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", page_name):
+        return bad(
+            handler,
+            "page_name must be 1-128 chars: alphanumeric, dot, dash, underscore (must not start with dot)",
+        )
+    if section not in {"entities", "concepts", "comparisons", "queries"}:
+        return bad(handler, f"invalid section: {section}")
+    if mode not in {"create", "append"}:
+        return bad(handler, f"invalid mode: {mode}")
+
+    try:
+        s = get_session(sid)
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+
+    # Resolve wiki
+    wiki_path, _, configured = _llm_wiki_resolve_path()
+    if not configured or not wiki_path.exists() or not wiki_path.is_dir():
+        return bad(handler, "wiki_not_configured", 404)
+
+    # Containment check
+    try:
+        target = (wiki_path / section / f"{page_name}.md").resolve()
+        wiki_real = wiki_path.resolve()
+        target.relative_to(wiki_real)
+    except (OSError, ValueError):
+        return bad(handler, "invalid path: must stay inside wiki root")
+
+    # Render markdown
+    from api.wiki_capture import render_session_markdown
+    safe = s.__dict__
+    markdown = render_session_markdown(safe)
+
+    # Ensure section dir
+    section_dir = wiki_path / section
+    try:
+        section_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return bad(handler, f"could not create section directory: {section}", 500)
+
+    if mode == "create":
+        if target.exists():
+            return j(handler, {"error": "exists", "path": str(target)}, status=409)
+        try:
+            target.write_text(markdown, encoding="utf-8")
+        except OSError as exc:
+            return bad(handler, f"write failed: {exc}", 500)
+        return j(handler, {"ok": True, "path": str(target)}, status=201)
+
+    # mode == "append"
+    if not target.exists():
+        return j(handler, {"error": "not_found", "path": str(target)}, status=409)
+    try:
+        import datetime as _dt
+        ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        existing = target.read_text(encoding="utf-8")
+        appended = existing.rstrip("\n") + f"\n\n---\n\n## Appended {ts}\n\n{markdown}\n"
+        target.write_text(appended, encoding="utf-8")
+    except OSError as exc:
+        return bad(handler, f"append failed: {exc}", 500)
+    return j(handler, {"ok": True, "path": str(target), "appended": True})
 
 
 def _session_search_message_text(message):

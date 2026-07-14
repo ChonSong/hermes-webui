@@ -8068,6 +8068,198 @@ function showConfirmDialog(opts={}){
   });
 }
 
+// ── Wiki save modal ────────────────────────────────────────────────────────
+
+let _wikiSaveState = null;
+const _WIKI_SECTIONS = ['concepts', 'entities', 'comparisons', 'queries'];
+
+function slugify(text) {
+  const raw = String(text == null ? '' : text).trim().toLowerCase();
+  const slug = raw.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return slug.slice(0, 64) || 'untitled';
+}
+
+function _closeWikiSaveModal() {
+  const overlay = document.getElementById('wikiSaveOverlay');
+  if (overlay) overlay.remove();
+  if (_wikiSaveState && _wikiSaveState.lastFocus) {
+    setTimeout(() => { if (_wikiSaveState.lastFocus.focus) _wikiSaveState.lastFocus.focus(); }, 0);
+  }
+  _wikiSaveState = null;
+}
+
+function _wikiSaveRenderConflict(page_name, section) {
+  const body = document.getElementById('wikiSaveBody');
+  if (!body) return;
+  body.innerHTML = '';
+  const msg = document.createElement('p');
+  msg.className = 'wiki-save-msg';
+  msg.innerHTML = `A page named <strong>${esc(page_name)}</strong> already exists in <strong>${esc(section)}</strong>.`;
+  body.appendChild(msg);
+
+  const footer = document.getElementById('wikiSaveFooter');
+  if (footer) {
+    footer.innerHTML = '';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'ws-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', _closeWikiSaveModal);
+    const appendBtn = document.createElement('button');
+    appendBtn.type = 'button';
+    appendBtn.className = 'ws-btn primary';
+    appendBtn.textContent = 'Append to bottom';
+    appendBtn.id = 'wikiSaveSubmit';
+    appendBtn.addEventListener('click', () => openWikiSaveModal._submitAppend());
+    footer.appendChild(cancelBtn);
+    footer.appendChild(appendBtn);
+    setTimeout(() => appendBtn.focus(), 0);
+  }
+}
+
+async function _wikiSaveSubmit(mode) {
+  if (!_wikiSaveState) return;
+  const { session, pageNameInput, sectionSelect } = _wikiSaveState;
+  const page_name = pageNameInput.value.trim() || slugify(session.title || session.session_id);
+  const section = sectionSelect.value;
+  _wikiSaveState.mode = mode;
+
+  const submitBtn = document.getElementById('wikiSaveSubmit');
+  if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Saving…'; }
+
+  let res;
+  try {
+    res = await api('/api/wiki/page', {
+      method: 'POST',
+      body: JSON.stringify({ session_id: session.session_id, page_name, section, mode }),
+    });
+  } catch (err) {
+    const msg = 'Save failed: ' + (err && err.message ? err.message : String(err || ''));
+    showToast(msg, 5000, 'error');
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Save to Wiki'; }
+    return;
+  }
+
+  if (res && res.error === 'exists') {
+    _wikiSaveRenderConflict(page_name, section);
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Save to Wiki'; }
+    return;
+  }
+  if (res && res.error) {
+    showToast('Error: ' + res.error, 5000, 'error');
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Save to Wiki'; }
+    return;
+  }
+
+  _closeWikiSaveModal();
+  const verb = res.appended ? 'Appended to' : 'Saved to';
+  showToast(`${verb} ${res.path}`, 3500, 'success');
+}
+
+openWikiSaveModal._submitAppend = () => _wikiSaveSubmit('append');
+
+function openWikiSaveModal(session, meta) {
+  if (!session || !session.session_id) { showToast('No session selected.', 3000); return; }
+  meta = meta || {};
+  const default_section = meta.default_section || 'concepts';
+  const slug = slugify(session.title || session.session_id);
+
+  _closeWikiSaveModal();
+  _wikiSaveState = { session, mode: 'create', lastFocus: document.activeElement };
+
+  const overlay = document.createElement('div');
+  overlay.id = 'wikiSaveOverlay';
+  overlay.className = 'ws-modal-overlay';
+
+  const card = document.createElement('div');
+  card.className = 'ws-modal-card';
+  card.setAttribute('role', 'dialog');
+  card.setAttribute('aria-labelledby', 'wikiSaveTitle');
+  card.setAttribute('aria-modal', 'true');
+
+  overlay.addEventListener('click', e => { if (e.target === overlay) _closeWikiSaveModal(); });
+
+  const body = document.createElement('div');
+  body.id = 'wikiSaveBody';
+  body.className = 'wiki-save-body';
+
+  const titleEl = document.createElement('h3');
+  titleEl.id = 'wikiSaveTitle';
+  titleEl.textContent = 'Save to Wiki';
+  body.appendChild(titleEl);
+
+  const pageLabel = document.createElement('label');
+  pageLabel.className = 'wiki-save-label';
+  pageLabel.textContent = 'Page name';
+  body.appendChild(pageLabel);
+
+  const pageNameInput = document.createElement('input');
+  pageNameInput.type = 'text';
+  pageNameInput.className = 'wiki-save-input';
+  pageNameInput.value = slug;
+  pageNameInput.placeholder = 'untitled';
+  pageNameInput.setAttribute('aria-label', 'Page name');
+  body.appendChild(pageNameInput);
+
+  const sectLabel = document.createElement('label');
+  sectLabel.className = 'wiki-save-label';
+  sectLabel.textContent = 'Section';
+  body.appendChild(sectLabel);
+
+  const sectionSelect = document.createElement('select');
+  sectionSelect.className = 'wiki-save-select';
+  sectionSelect.setAttribute('aria-label', 'Section');
+  _WIKI_SECTIONS.forEach(sec => {
+    const opt = document.createElement('option');
+    opt.value = sec;
+    opt.textContent = sec;
+    if (sec === default_section) opt.selected = true;
+    sectionSelect.appendChild(opt);
+  });
+  body.appendChild(sectionSelect);
+  card.appendChild(body);
+
+  const footer = document.createElement('div');
+  footer.id = 'wikiSaveFooter';
+  footer.className = 'wiki-save-footer';
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.className = 'ws-btn';
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', _closeWikiSaveModal);
+
+  const submitBtn = document.createElement('button');
+  submitBtn.type = 'button';
+  submitBtn.id = 'wikiSaveSubmit';
+  submitBtn.className = 'ws-btn primary';
+  submitBtn.textContent = 'Save to Wiki';
+  submitBtn.addEventListener('click', () => _wikiSaveSubmit('create'));
+
+  footer.appendChild(cancelBtn);
+  footer.appendChild(submitBtn);
+  card.appendChild(footer);
+  overlay.appendChild(card);
+  document.body.appendChild(overlay);
+
+  _wikiSaveState.pageNameInput = pageNameInput;
+  _wikiSaveState.sectionSelect = sectionSelect;
+
+  overlay.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); _closeWikiSaveModal(); return; }
+    if (e.key === 'Enter') {
+      const target = e.target;
+      if (target && target.tagName === 'TEXTAREA') return;
+      e.preventDefault();
+      _wikiSaveSubmit(_wikiSaveState.mode);
+    }
+  });
+
+  setTimeout(() => submitBtn.focus(), 0);
+}
+
+window.openWikiSaveModal = openWikiSaveModal;
+
 function showPromptDialog(opts={}){
   _ensureAppDialogBindings();
   if(APP_DIALOG.resolve) _finishAppDialog(null,false);

@@ -4640,6 +4640,36 @@ function _appendSessionExportHtmlAction(menu, session){
   ));
 }
 
+function getWikiSessionMeta(){
+  // Reads extension settings for the session-to-wiki extension (if loaded)
+  // and returns the default_section for the wiki save modal.
+  try{
+    if(window.HermesExtensionSettings){
+      const ext=window.HermesExtensionSettings.forExtension('session-to-wiki');
+      if(ext&&ext.storageOwned){return {default_section: ext.values.default_section||'concepts'};}
+    }
+  }catch(_){}
+  return {default_section:'concepts'};
+}
+
+function _appendSessionAddToWikiAction(menu, session){
+  // "Add to Wiki" — saves this conversation as a wiki page via the
+  // session-to-wiki extension's save modal. The modal handles the POST
+  // and surfaces a toast if the wiki is not configured (404 wiki_not_configured).
+  // Always shown — the error surfaces at POST time, not at menu build time.
+  // openWikiSaveModal is a global defined by the extension (loaded after sessions.js
+  // under defer, so it's bound by the time this click can fire).
+  menu.appendChild(_buildSessionAction(
+    t('session_add_to_wiki')||'Add to wiki',
+    t('session_add_to_wiki_desc')||'Save this conversation as a wiki page',
+    ICONS.spark,
+    ()=>{
+      closeSessionActionMenu();
+      if(typeof openWikiSaveModal==='function') openWikiSaveModal(session, getWikiSessionMeta());
+    }
+  ));
+}
+
 function _playSessionActionMenuEntrance(menu){
   if(!menu) return;
   const reduce=_sessionPrefersReducedMotion();
@@ -4792,6 +4822,7 @@ function _openSessionActionMenu(session, anchorEl){
     _appendSessionDuplicateAction(menu, session);
   }
   _appendSessionExportHtmlAction(menu, session);
+  _appendSessionAddToWikiAction(menu, session);
   if(session.active_stream_id){
     menu.appendChild(_buildSessionAction(
       t('session_stop_response'),

@@ -2385,12 +2385,23 @@ document.addEventListener('keydown',async e=>{
       return;
     }
   }
+  // Ctrl+Shift+W opens wiki save modal for active session (when not composing)
+  if((e.metaKey||e.ctrlKey)&&e.shiftKey&&(e.key==='w'||e.key==='W')){
+    const t=e.target;
+    const isText=t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.isContentEditable);
+    if(!isText&&S.session&&typeof openWikiSaveModal==='function'){
+      e.preventDefault();
+      openWikiSaveModal(S.session,{default_section:'concepts'});
+      return;
+    }
+  }
   // Cmd/Ctrl+/ focuses the message composer without creating a chat.
   // Match on the '/' CHARACTER (e.key), not the physical key position: on QWERTZ
   // layouts the physical Slash key produces Ctrl+- (browser zoom-out) and '/' is
   // typed as Shift+7, so matching the physical code both steals zoom and misses
   // the real '/' chord. e.key==='/' is layout-correct on every keyboard.
   if((e.metaKey||e.ctrlKey)&&!e.altKey&&e.key==='/'){
+
     const t=e.target;
     const isText=t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.isContentEditable);
     if(isText) return;
