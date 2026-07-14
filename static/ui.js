@@ -16441,6 +16441,7 @@ function buildToolCard(tc){
   row.dataset.toolName=String(tc&&tc.name||'tool');
   const toolKind=typeof _toolActionKind==='function'?_toolActionKind(tc):'unknown';
   row.dataset.toolKind=toolKind;
+  const toolReadPath=toolKind==='read'?_toolTargetLabel(tc):'';
   row.dataset.toolDone=String(tc&&tc.done!==false);
   row.dataset.toolError=String(!!(tc&&tc.is_error));
   row.dataset.toolActionLabel=typeof _toolActionLabelText==='function'?_toolActionLabelText(tc):_toolDisplayName(tc);
@@ -16503,7 +16504,9 @@ function buildToolCard(tc){
           <pre>${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?`<code class="diff-block" data-highlighted="1">${_colorDiffLines(displaySnippet)}</code>`:esc(displaySnippet)}</pre>
           ${hasMore?`<button class="tool-card-more" data-full="${esc(tc.snippet||'').replace(/"/g,'&quot;')}" data-short="${esc(displaySnippet||'').replace(/"/g,'&quot;')}" data-is-diff="${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?1:0}" data-more-label="${esc(moreLabel)}" data-less-label="${esc(lessLabel)}" onclick="event.stopPropagation();_toggleToolDiff(this)">${esc(moreLabel)}</button>`:''}
         </div>`:''}
+        ${toolReadPath?`<div class="tool-card-ws-open"><button class="tool-card-ws-open-btn" data-ws-path="${esc(toolReadPath)}" onclick="event.stopPropagation();var p=this.dataset.wsPath;if(p)openArtifactPath(p)">${li('folder-open',12)} Open in workspace</button></div>`:''}
       </div>`:''}
+    ${!hasDetail && toolReadPath?`<div class="tool-card-ws-open" style="padding:2px 12px 8px"><button class="tool-card-ws-open-btn" data-ws-path="${esc(toolReadPath)}" onclick="event.stopPropagation();var p=this.dataset.wsPath;if(p)openArtifactPath(p)">${li('folder-open',12)} Open in workspace</button></div>`:''}
     </div>`;
   row._tcData = tc;
   // Durable classification flags: _tcData (a JS property) does NOT survive the
