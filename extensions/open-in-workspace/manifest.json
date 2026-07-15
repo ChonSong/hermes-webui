@@ -1,0 +1,7 @@
+{
+  "id": "open-in-workspace",
+  "name": "Open in Workspace",
+  "description": "Adds an 'Open in workspace' button to read_file tool cards, letting you click to reveal the file in the workspace file-tree panel.",
+  "scripts": ["open-in-workspace.js"],
+  "stylesheets": []
+}
