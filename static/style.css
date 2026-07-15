@@ -3568,10 +3568,6 @@ body.resizing .sidebar{transition:none!important;}
 /* Show more button inside tool card result */
 .tool-card-more{background:none;border:none;color:var(--blue);font-size:10px;cursor:pointer;padding:3px 0 0;opacity:.7;display:block;}
 .tool-card-more:hover{opacity:1;}
-/* Open in workspace button inside tool card detail */
-.tool-card-ws-open{padding:4px 12px 8px;}
-.tool-card-ws-open-btn{background:none;border:none;color:var(--blue);font-size:10px;cursor:pointer;padding:0;opacity:.7;display:inline-flex;align-items:center;gap:3px;white-space:nowrap;}
-.tool-card-ws-open-btn:hover{opacity:1;}
 /* Subagent cards: indented with accent border */
 .tool-card.tool-card-subagent{border-left:0;margin-left:0;}
 /* Token usage badge below assistant messages */
