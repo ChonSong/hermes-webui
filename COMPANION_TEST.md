@@ -22,3 +22,4 @@ This PR modifies three interconnected files:
 
 - Best-effort draft overlay — malformed drafts don't crash session load
 - Concurrent autosaves/deletes serialized via per-session locks
+# diff test
