@@ -81,7 +81,7 @@ def test_draft_validation_appears_before_persist():
     src = Path(__file__).parents[1].joinpath("api", "routes.py").read_text(encoding="utf-8")
     # Anchor on the unique POST-validation comment marker.
     marker_idx = src.find("Stage-326 hardening (per Opus advisor)")
-    persist_idx = src.find("s.composer_draft = next_draft\n                # Draft persistence is not conversation activity")
+    persist_idx = src.find("DraftOptimization.save_draft(session_dir, sid, next_draft)", marker_idx)
     assert marker_idx != -1 and persist_idx != -1, (
         "could not locate validation marker or persist site"
     )
