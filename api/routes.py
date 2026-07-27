@@ -14119,12 +14119,12 @@ def handle_post(handler, parsed) -> bool:
                 saved_draft = current_draft
             else:
                 s.composer_draft = next_draft
-                # Draft persistence is not conversation activity. Touching updated_at
-                # here makes the active-session external-refresh poll force-reload the
-                # current chat every few seconds while the user is typing, and that
-                # delayed reload can restore an older draft over newer local input.
-                _draft_mark("before_save")
-                s.save(touch_updated_at=False, skip_index=True)
+                # OPTIMIZATION: Use atomic per-session draft persistence instead of
+                # calling s.save() which rewrites the entire session JSON file.
+                # This reduces latency for large-session composer drafts.
+                from api.draft_optimization import DraftOptimization
+                session_dir = Path(s.session_file).parent
+                DraftOptimization.save_draft(session_dir, sid, next_draft)
                 _draft_mark("after_save")
                 saved_draft = s.composer_draft
         _draft_mark("released_lock")

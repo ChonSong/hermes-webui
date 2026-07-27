@@ -1414,6 +1414,13 @@ class Session:
         _pre_read_sig = _sidecar_stat_signature(p)
         data = json.loads(p.read_text(encoding='utf-8'))
         data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
+        # Overlay per-session draft if available
+        try:
+            from api.draft_optimization import DraftOptimization
+            data = DraftOptimization.overlay_draft(SESSION_DIR, sid, data)
+        except Exception:
+            pass  # Draft overlay is best-effort
+
         session = cls(**data)
         if _collapsed_partials:
             try:
