@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import tempfile
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlparse
