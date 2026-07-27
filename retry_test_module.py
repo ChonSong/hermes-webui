@@ -13,3 +13,4 @@ def flaky_function():
 def another_function():
     """This function works correctly."""
     return {"status": "ok"}
+# trigger workflow
