@@ -15,7 +15,6 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Optional
 
 # Lock striping to serialize concurrent draft saves/deletes per session
 _LOCKS: dict[str, threading.Lock] = {}

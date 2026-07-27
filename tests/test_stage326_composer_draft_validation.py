@@ -96,12 +96,16 @@ def test_draft_save_does_not_touch_session_updated_at():
     If POST /api/session/draft bumps updated_at, the frontend's active-session
     external refresh poll treats every keystroke autosave as a remote session
     update and force-reloads the current chat a few seconds later.
+
+    The optimization uses DraftOptimization.save_draft() which writes to a
+    separate draft file — it never touches the session JSON or updated_at.
     """
     src = Path(__file__).parents[1].joinpath("api", "routes.py").read_text(encoding="utf-8")
     persist_idx = src.find("s.composer_draft = next_draft")
     assert persist_idx != -1, "could not locate composer draft persist site"
-    save_idx = src.find("s.save(touch_updated_at=False, skip_index=True)", persist_idx)
-    assert save_idx != -1, "composer draft save must preserve session updated_at and skip index churn"
+    # DraftOptimization.save_draft writes to .drafts/{session_id}.json — no session save
+    save_idx = src.find("DraftOptimization.save_draft(session_dir, sid, next_draft)", persist_idx)
+    assert save_idx != -1, "composer draft must use DraftOptimization.save_draft (atomic, no session rewrite)"
 
 
 def test_draft_save_skips_unchanged_payload_before_persist():
@@ -109,10 +113,10 @@ def test_draft_save_skips_unchanged_payload_before_persist():
     src = Path(__file__).parents[1].joinpath("api", "routes.py").read_text(encoding="utf-8")
     draft_idx = src.find('current_draft = dict(getattr(s, "composer_draft", {}) or {})')
     unchanged_idx = src.find("if next_draft == current_draft", draft_idx)
-    save_idx = src.find("s.save(touch_updated_at=False, skip_index=True)", draft_idx)
+    save_idx = src.find("DraftOptimization.save_draft(session_dir, sid, next_draft)", draft_idx)
 
     assert draft_idx != -1, "draft route should snapshot current composer_draft"
     assert unchanged_idx != -1, "draft route should no-op unchanged normalized payloads"
-    assert save_idx != -1, "draft route should still save changed drafts"
-    assert unchanged_idx < save_idx, "unchanged guard must run before full session save"
+    assert save_idx != -1, "draft route should still save changed drafts via DraftOptimization"
+    assert unchanged_idx < save_idx, "unchanged guard must run before draft save"
     assert 'payload["unchanged"] = True' in src
