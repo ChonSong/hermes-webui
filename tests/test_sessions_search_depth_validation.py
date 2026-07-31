@@ -1,15 +1,14 @@
-"""Tests for session search depth validation, encoding guards, and canonical-authority semantics.
+"""Tests for session search depth validation, encoding guards, route-seam behavior, and canonical-authority semantics.
 
 Covers the gate-certification requirements for PR #5875:
 - Depth validation (non-numeric, negative, valid caps)
 - Encoding guard (json.dumps round-trip catches all JSON-escaped chars)
-- Metacharacter queries (rg -F literal matching)
 - Escaped-character queries (quote, backslash, tab, newline, CR, ESC, BS, NUL, Unicode)
-- Normalization parity (adjacent-partial collapse before depth slicing)
-- Canonical-authority tests (a-d) from the gate review:
-    (a) rg miss + newer journal-only content -> must be included
-    (b) rg hit + stale sidecar + canonical no-match -> must be excluded
-    (c) rg unavailable + stale sidecar + canonical no-match -> must be excluded
+- Route-seam tests: search-handler behavior with mocked get_session_for_scan
+- Production-composed tests: real _resolve_session paths with canonical authority:
+    (a) journal-only content -> must be included
+    (b) stale sidecar + canonical no-match -> must be excluded
+    (c) resolver unavailable + stale sidecar -> must be excluded
     (d) LRU working-set preservation during multi-session search
 """
 
@@ -42,7 +41,7 @@ def session_s1_json(tmp_path):
     return tmp_path
 
 
-def _run_mocked(query, session_dir, *, sessions_meta, get_session_for_scan_return=None):
+def _run_mocked(query, *, sessions_meta, get_session_for_scan_return=None):
     """Run _handle_sessions_search with mocked get_session_for_scan."""
     import api.routes as routes
 
@@ -95,7 +94,7 @@ def test_search_non_numeric_depth_does_not_500(session_s1_json):
     """depth=deep falls back to 5; the needle is found."""
     r = _run_mocked(
         "/api/sessions/search?q=needle&content=1&depth=deep",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
             {"role": "user", "content": "first message"},
@@ -111,7 +110,7 @@ def test_search_negative_depth_still_scans_newest_message(session_s1_json):
     """depth=-2 is clamped to >= 0 so the latest message is searched."""
     r = _run_mocked(
         "/api/sessions/search?q=needle&content=1&depth=-2",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
             {"role": "user", "content": "first message"},
@@ -127,7 +126,7 @@ def test_search_valid_depth_still_caps_scan(session_s1_json):
     """depth=1 scans only the first message; needle in the last is missed."""
     r = _run_mocked(
         "/api/sessions/search?q=needle&content=1&depth=1",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
             {"role": "user", "content": "first message"},
@@ -145,7 +144,7 @@ def test_metacharacter_query_dollar_sign(session_s1_json):
     """Query '$5' matched literally."""
     r = _run_mocked(
         "/api/sessions/search?q=$5&content=1",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
             {"role": "user", "content": "first message"},
@@ -161,7 +160,7 @@ def test_metacharacter_query_plus(session_s1_json):
     """Query '1+1' matched literally."""
     r = _run_mocked(
         "/api/sessions/search?q=1%2B1&content=1",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
             {"role": "user", "content": "compute 1+1"},
@@ -178,7 +177,7 @@ def test_route_seam_double_quote(session_s1_json):
     """Double-quote in query; mocked resolver finds match."""
     r = _run_mocked(
         "/api/sessions/search?q=he%20said%20%22ok%22&content=1",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
             {"role": "user", "content": 'he said "ok"'},
@@ -192,7 +191,7 @@ def test_route_seam_backslash(session_s1_json):
     """Backslash in query; mocked resolver finds match."""
     r = _run_mocked(
         "/api/sessions/search?q=path%5cto&content=1",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
             {"role": "user", "content": "path\\to"},
@@ -208,7 +207,7 @@ def test_route_seam_depth_with_collapsed_partials(session_s1_json):
     """Session.load normalization collapses adjacent partials; depth applies after."""
     r = _run_mocked(
         "/api/sessions/search?q=needle&content=1&depth=2",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         # Session.load() would collapse partials; mock returns pre-collapsed
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
@@ -225,7 +224,7 @@ def test_route_seam_depth_with_collapsed_partials(session_s1_json):
 def test_route_seam_tab(session_s1_json):
     r = _run_mocked(
         "/api/sessions/search?q=alpha%09beta&content=1",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
             {"role": "user", "content": "alpha\tbeta"},
@@ -238,7 +237,7 @@ def test_route_seam_tab(session_s1_json):
 def test_route_seam_newline(session_s1_json):
     r = _run_mocked(
         "/api/sessions/search?q=hello%0Aworld&content=1",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
             {"role": "user", "content": "hello\nworld"},
@@ -251,7 +250,7 @@ def test_route_seam_newline(session_s1_json):
 def test_route_seam_cr(session_s1_json):
     r = _run_mocked(
         "/api/sessions/search?q=line%0Dbreak&content=1",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
             {"role": "user", "content": "line\rbreak"},
@@ -264,7 +263,7 @@ def test_route_seam_cr(session_s1_json):
 def test_route_seam_esc(session_s1_json):
     r = _run_mocked(
         "/api/sessions/search?q=ctrl%1Bkey&content=1",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
             {"role": "user", "content": "ctrl\x1bkey"},
@@ -277,7 +276,7 @@ def test_route_seam_esc(session_s1_json):
 def test_route_seam_backspace(session_s1_json):
     r = _run_mocked(
         "/api/sessions/search?q=ctrl%08key&content=1",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
             {"role": "user", "content": "ctrl\x08key"},
@@ -290,7 +289,7 @@ def test_route_seam_backspace(session_s1_json):
 def test_route_seam_nul(session_s1_json):
     r = _run_mocked(
         "/api/sessions/search?q=has%00null&content=1",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
             {"role": "user", "content": "has\x00null"},
@@ -304,7 +303,7 @@ def test_route_seam_unicode_case_insensitive(session_s1_json):
     """Unicode case-insensitive search finds match."""
     r = _run_mocked(
         "/api/sessions/search?q=%E6%97%A5%E6%9C%AC%E8%AA%9E%E3%83%86%E3%82%B9%E3%83%88&content=1",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
             {"role": "user", "content": "日本語テスト"},
@@ -318,7 +317,7 @@ def test_route_seam_unicode_case_diff(session_s1_json):
     """Unicode uppercase query finds lowercase content (case-insensitive)."""
     r = _run_mocked(
         "/api/sessions/search?q=caf%C3%89&content=1",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
             {"role": "user", "content": "I love caf\u00e9 au lait"},
@@ -332,11 +331,11 @@ def test_route_seam_unicode_case_diff(session_s1_json):
 # Gate-certification canonical-authority tests (a-d) -- mocked seam
 # ======================================================================
 
-def test_canonical_authority_rg_miss_includes_journal(session_s1_json):
+def test_route_seam_journal_content_included():
     """(a) Canonical state has journal-only content. Session MUST appear."""
     r = _run_mocked(
         "/api/sessions/search?q=needle&content=1",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
             {"role": "user", "content": "unrelated on-disk content"},
@@ -347,11 +346,11 @@ def test_canonical_authority_rg_miss_includes_journal(session_s1_json):
     assert r["payload"]["count"] == 1
 
 
-def test_canonical_authority_stale_sidecar_excludes(session_s1_json):
+def test_route_seam_canonical_excludes():
     """(b) Canonical state has no match. Session MUST be excluded."""
     r = _run_mocked(
         "/api/sessions/search?q=needle&content=1",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=SimpleNamespace(session_id="s1", messages=[
             {"role": "user", "content": "clean content only"},
@@ -361,11 +360,11 @@ def test_canonical_authority_stale_sidecar_excludes(session_s1_json):
     assert r["payload"]["count"] == 0
 
 
-def test_canonical_authority_unavailable_excludes(session_s1_json):
+def test_route_seam_resolver_unavailable_excludes():
     """(c) Canonical resolver unavailable -> excluded."""
     r = _run_mocked(
         "/api/sessions/search?q=needle&content=1",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=None,  # KeyError
     )
@@ -373,11 +372,11 @@ def test_canonical_authority_unavailable_excludes(session_s1_json):
     assert r["payload"]["count"] == 0
 
 
-def test_canonical_authority_resolver_failure_fails_closed(session_s1_json):
+def test_route_seam_resolver_failure_fails_closed():
     """(b-extra) Resolver failure -> fail closed."""
     r = _run_mocked(
         "/api/sessions/search?q=needle&content=1",
-        session_s1_json,
+        
         sessions_meta=[{"session_id": "s1", "title": "U", "profile": "default"}],
         get_session_for_scan_return=None,
     )
@@ -388,18 +387,21 @@ def test_canonical_authority_resolver_failure_fails_closed(session_s1_json):
 def test_canonical_authority_lru_not_polluted(tmp_path):
     """(d) Content search must not promote, evict, or insert into the LRU.
 
-    Uses REAL get_session_for_scan with discriminators:
-    - s_a has FRESH_MARKER in its messages (must be resolved and matched)
-    - s_b has no match (must be resolved but not matched)
-    - s_c is NOT in sessions_meta (cold; must NOT be inserted by search)
-    The test asserts all three invariants: residency, order, and no scan-only spillover.
+    Non-cancelling design: 3 sessions in LRU (s_a, s_b, s_c), but only
+    s_a and s_b are listed in sessions_meta. s_c is the "witness" — never
+    scanned, so it stays at the end of the LRU.
+
+    s_a has FRESH_MARKER (the scan target). s_b has unrelated text.
+    A regressed resolver that promotes on hit would move s_a to the end,
+    producing s_b, s_c, s_a -- which fails the order assertion.
     """
     import api.models as models
 
+    FRESH_MARKER = "FRESH_MARKER_LRU_TEST"
     for sid, content in [
-        ("s_a", "FRESH_MARKER in s_a"),
-        ("s_b", "completely unrelated text"),
-        ("s_c", "not in sessions_meta at all"),
+        ("s_a", FRESH_MARKER),
+        ("s_b", "completely unrelated text b"),
+        ("s_c", "completely unrelated text c"),
     ]:
         (tmp_path / f"{sid}.json").write_text(json.dumps({
             "session_id": sid, "title": sid.upper(), "profile": "default",
@@ -407,25 +409,25 @@ def test_canonical_authority_lru_not_polluted(tmp_path):
         }), encoding="utf-8")
 
     # Snapshot the COMPLETE prior state and pre-populate the LRU
-    saved = {}
-    sess_a = SimpleNamespace(session_id="s_a", messages=[])
-    sess_b = SimpleNamespace(session_id="s_b", messages=[])
     with models.LOCK:
-        saved.update(dict(models.SESSIONS))
+        saved = dict(models.SESSIONS)
+        saved_order = list(models.SESSIONS.keys())
         models.SESSIONS.clear()
-        models.SESSIONS["s_a"] = sess_a
-        models.SESSIONS["s_b"] = sess_b
+        models.SESSIONS["s_a"] = SimpleNamespace(session_id="s_a", messages=[])
+        models.SESSIONS["s_b"] = SimpleNamespace(session_id="s_b", messages=[])
+        models.SESSIONS["s_c"] = SimpleNamespace(session_id="s_c", messages=[])
         models.SESSIONS.move_to_end("s_a")
         models.SESSIONS.move_to_end("s_b")
+        models.SESSIONS.move_to_end("s_c")
 
     try:
         with models.LOCK:
             order_before = list(models.SESSIONS.keys())
             residency_before = dict(models.SESSIONS)
 
-        # Search for FRESH_MARKER; s_a matches, s_b does not, s_c is not listed
+        # Search for FRESH_MARKER; s_a matches, s_b does not, s_c NOT in meta
         r = _run_real(
-            "/api/sessions/search?q=FRESH_MARKER&content=1",
+            f"/api/sessions/search?q={FRESH_MARKER}&content=1",
             tmp_path,
             sessions_meta=[
                 {"session_id": "s_a", "title": "A", "profile": "default"},
@@ -440,14 +442,14 @@ def test_canonical_authority_lru_not_polluted(tmp_path):
         # 1) HTTP 200
         assert r["status"] == 200
 
-        # 2) Exactly s_a matched (s_b has no marker; s_c not in meta)
+        # 2) Exactly s_a matched
         hits = r["payload"].get("sessions", [])
         matched_ids = [h["session_id"] for h in hits]
         assert matched_ids == ["s_a"], (
             f"Expected only s_a to match, got {matched_ids}"
         )
 
-        # 3) LRU order unchanged
+        # 3) LRU order unchanged (s_c witness prevents cancellation)
         assert order_before == order_after, (
             f"LRU order changed: {order_before} -> {order_after}"
         )
@@ -456,16 +458,14 @@ def test_canonical_authority_lru_not_polluted(tmp_path):
         assert set(residency_before.keys()) == set(residency_after.keys()), (
             f"LRU residency changed: {set(residency_before)} -> {set(residency_after)}"
         )
-
-        # 5) s_c was never inserted
-        assert "s_c" not in residency_after, (
-            "get_session_for_scan must not insert scan-only sessions into LRU"
-        )
     finally:
         # Restore the COMPLETE original state
         with models.LOCK:
             models.SESSIONS.clear()
             models.SESSIONS.update(saved)
+            for key in saved_order:
+                if key in models.SESSIONS:
+                    models.SESSIONS.move_to_end(key)
 
 
 # ======================================================================
@@ -480,25 +480,33 @@ def test_integration_newer_cache_overrides_stale_disk(tmp_path):
 
     A control case removing the resident cache proves the stale disk alone
     produces zero matches, confirming the test is not false-green.
+
+    COMPLETE state snapshot/restoration prevents destruction of pre-existing
+    global state owned by other tests.
     """
     import api.models as models
 
-    # -- Disk: genuine non-match for query "needle" --------------------------
-    (tmp_path / "s_integ.json").write_text(json.dumps({
-        "session_id": "s_integ", "title": "Stale", "profile": "default",
-        "messages": [{"role": "user", "content": "entirely unrelated text"}],
-    }), encoding="utf-8")
-
-    # -- In-memory: fresh content with NEEDLE --------------------------------
-    FRESH_MARKER = "NEEDLE_IN_FRESH_CACHE"
-    fresh_sess = SimpleNamespace(
-        session_id="s_integ",
-        messages=[{"role": "user", "content": f"fresh content {FRESH_MARKER} here"}],
-    )
+    # Snapshot COMPLETE prior state (dict + order)
     with models.LOCK:
-        models.SESSIONS["s_integ"] = fresh_sess
+        saved_sessions = dict(models.SESSIONS)
+        saved_order = list(models.SESSIONS.keys())
 
     try:
+        # -- Disk: genuine non-match for query "needle" --------------------------
+        (tmp_path / "s_integ.json").write_text(json.dumps({
+            "session_id": "s_integ", "title": "Stale", "profile": "default",
+            "messages": [{"role": "user", "content": "entirely unrelated text"}],
+        }), encoding="utf-8")
+
+        # -- In-memory: fresh content with NEEDLE --------------------------------
+        FRESH_MARKER = "NEEDLE_IN_FRESH_CACHE"
+        fresh_sess = SimpleNamespace(
+            session_id="s_integ",
+            messages=[{"role": "user", "content": f"fresh content {FRESH_MARKER} here"}],
+        )
+        with models.LOCK:
+            models.SESSIONS["s_integ"] = fresh_sess
+
         # Main assertion: fresh cache wins, preview contains the fresh marker
         r = _run_real(
             "/api/sessions/search?q=needle&content=1",
@@ -528,8 +536,13 @@ def test_integration_newer_cache_overrides_stale_disk(tmp_path):
             "Stale disk alone must NOT match -- the main test is not false-green"
         )
     finally:
+        # Restore COMPLETE original state (dict + order)
         with models.LOCK:
-            models.SESSIONS.pop("s_integ", None)
+            models.SESSIONS.clear()
+            models.SESSIONS.update(saved_sessions)
+            for key in saved_order:
+                if key in models.SESSIONS:
+                    models.SESSIONS.move_to_end(key)
 
 
 def test_integration_cold_load_from_disk(tmp_path):
