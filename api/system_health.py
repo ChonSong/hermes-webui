@@ -162,13 +162,13 @@ def _safe_error(metric: str, exc: Exception) -> dict[str, str]:
 
 _NET_MAX_BYTES_PER_SEC = 125_000_000  # ~1 Gbps reference for percent clamp
 _NET_LOCK = threading.Lock()
-_NET_PREV: dict[str, int] | None = None
+_NET_PREV: dict[str, tuple[int, int]] | None = None
 _NET_PREV_TIME: float = 0.0
 
 
-def _read_proc_net_dev() -> dict[str, int]:
-    """Return {iface: total_bytes} from /proc/net/dev. Empty on non-Linux."""
-    stats: dict[str, int] = {}
+def _read_proc_net_dev() -> dict[str, tuple[int, int]]:
+    """Return {iface: (rx_bytes, tx_bytes)} from /proc/net/dev. Empty on non-Linux."""
+    stats: dict[str, tuple[int, int]] = {}
     try:
         with open("/proc/net/dev", "r", encoding="utf-8") as handle:
             for line in handle:
@@ -181,7 +181,7 @@ def _read_proc_net_dev() -> dict[str, int]:
                 parts = rest.split()
                 if len(parts) < 9:
                     continue
-                stats[iface] = int(parts[0]) + int(parts[8])
+                stats[iface] = (int(parts[0]), int(parts[8]))
     except (OSError, ValueError):
         pass
     return stats
@@ -203,28 +203,30 @@ def _net_snapshot() -> tuple[float, float, float]:
             try:
                 psutil = _load_optional_psutil()
                 io = psutil.net_io_counters()
-                total = int(io.bytes_recv) + int(io.bytes_sent)
+                rx_total, tx_total = int(io.bytes_recv), int(io.bytes_sent)
             except Exception:
                 return (0.0, 0.0, 0.0)
 
             if _NET_PREV is None or now - _NET_PREV_TIME < 0.1:
-                _NET_PREV = {"_psutil_total": total}
+                _NET_PREV = {"_psutil": (rx_total, tx_total)}
                 _NET_PREV_TIME = now
                 return (0.0, 0.0, 0.0)
 
             elapsed = now - _NET_PREV_TIME
             if elapsed <= 0:
                 return (0.0, 0.0, 0.0)
-            prev_total = _NET_PREV.get("_psutil_total", 0)
-            total_delta = max(0, total - prev_total)
-            _NET_PREV = {"_psutil_total": total}
+            prev_rx, prev_tx = _NET_PREV.get("_psutil", (0, 0))
+            rx_delta = max(0, rx_total - prev_rx)
+            tx_delta = max(0, tx_total - prev_tx)
+            _NET_PREV = {"_psutil": (rx_total, tx_total)}
             _NET_PREV_TIME = now
+            total_delta = rx_delta + tx_delta
             percent = _clamp_percent((total_delta / elapsed / _NET_MAX_BYTES_PER_SEC) * 100.0)
-            return (0.0, 0.0, percent)
+            return (rx_delta / elapsed, tx_delta / elapsed, percent)
 
         # Linux procfs path
-        rx_total = sum(int(v) for v in current.values())
-        tx_total = 0
+        rx_total = sum(rx for rx, _ in current.values())
+        tx_total = sum(tx for _, tx in current.values())
 
         if _NET_PREV is None or now - _NET_PREV_TIME < 0.1:
             _NET_PREV = current
@@ -235,15 +237,19 @@ def _net_snapshot() -> tuple[float, float, float]:
         if elapsed <= 0:
             return (0.0, 0.0, 0.0)
 
-        prev_total = sum(int(v) for v in _NET_PREV.values())
-        total_delta = max(0, rx_total - prev_total)
+        prev_rx = sum(rx for rx, _ in _NET_PREV.values())
+        prev_tx = sum(tx for _, tx in _NET_PREV.values())
+        rx_delta = max(0, rx_total - prev_rx)
+        tx_delta = max(0, tx_total - prev_tx)
+        total_delta = rx_delta + tx_delta
 
         _NET_PREV = current
         _NET_PREV_TIME = now
 
-        rx_per_sec = total_delta / elapsed
-        percent = _clamp_percent((rx_per_sec / _NET_MAX_BYTES_PER_SEC) * 100.0)
-        return (rx_per_sec, 0.0, percent)
+        rx_per_sec = rx_delta / elapsed
+        tx_per_sec = tx_delta / elapsed
+        percent = _clamp_percent((total_delta / elapsed / _NET_MAX_BYTES_PER_SEC) * 100.0)
+        return (rx_per_sec, tx_per_sec, percent)
 
 
 _DISK_LOCK = threading.Lock()

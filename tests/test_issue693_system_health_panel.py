@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
+import time
 from types import SimpleNamespace
 from urllib.parse import urlparse
+
+import pytest
 
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent
@@ -404,3 +407,65 @@ def test_disk_io_returns_empty_on_non_linux(monkeypatch):
 
     result = system_health._disk_io()
     assert result == {}
+
+
+def test_net_snapshot_tracks_rx_tx_directions_separately(monkeypatch):
+    """rx and tx bytes must be tracked separately — tx must not be reported as rx."""
+    from api import system_health
+
+    # Reset global state
+    monkeypatch.setattr(system_health, "_NET_PREV", None)
+    monkeypatch.setattr(system_health, "_NET_PREV_TIME", 0.0)
+
+    # First call: baseline with (rx=100, tx=50)
+    monkeypatch.setattr(
+        system_health,
+        "_read_proc_net_dev",
+        lambda: {"eth0": (100, 50)},
+    )
+    result1 = system_health._net_snapshot()
+    assert result1 == (0.0, 0.0, 0.0)
+
+    # Advance time
+    monkeypatch.setattr(system_health, "_NET_PREV_TIME", time.time() - 1.0)
+
+    # Second call: rx grew by 200 (to 300), tx grew by 100 (to 150)
+    monkeypatch.setattr(
+        system_health,
+        "_read_proc_net_dev",
+        lambda: {"eth0": (300, 150)},
+    )
+    rx, tx, _ = system_health._net_snapshot()
+    assert rx == pytest.approx(200.0, abs=1e-3), f"Expected rx=200.0, got {rx}"
+    assert tx == pytest.approx(100.0, abs=1e-3), f"Expected tx=100.0, got {tx}"
+
+
+def test_net_snapshot_does_not_double_count_combined_bytes(monkeypatch):
+    """Regression: rx_delta + tx_delta must not be reported as rx_bytes_per_sec."""
+    from api import system_health
+
+    # Reset global state
+    monkeypatch.setattr(system_health, "_NET_PREV", None)
+    monkeypatch.setattr(system_health, "_NET_PREV_TIME", 0.0)
+
+    # Baseline
+    monkeypatch.setattr(
+        system_health,
+        "_read_proc_net_dev",
+        lambda: {"eth0": (1000, 500)},
+    )
+    system_health._net_snapshot()
+
+    # Advance time
+    monkeypatch.setattr(system_health, "_NET_PREV_TIME", time.time() - 1.0)
+
+    # rx grew by 500, tx grew by 300 — total delta = 800
+    # Bug would report rx=800, tx=0 instead of rx=500, tx=300
+    monkeypatch.setattr(
+        system_health,
+        "_read_proc_net_dev",
+        lambda: {"eth0": (1500, 800)},
+    )
+    rx, tx, _ = system_health._net_snapshot()
+    assert rx == pytest.approx(500.0, abs=1e-3), f"Expected rx=500.0, got {rx}"
+    assert tx == pytest.approx(300.0, abs=1e-3), f"Expected tx=300.0, got {tx}"
