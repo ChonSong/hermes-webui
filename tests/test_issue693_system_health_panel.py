@@ -64,6 +64,7 @@ def test_system_health_payload_normalizes_safe_aggregate_metrics(monkeypatch):
     assert payload["cpu"] == {"percent": 17.3}
     assert payload["memory"] == {"used_bytes": 4000, "total_bytes": 10000, "percent": 40.0}
     assert payload["disk"] == {"used_bytes": 55500, "total_bytes": 100000, "percent": 55.5}
+    assert payload["net"] is not None
     assert payload["checked_at"]
     rendered = repr(payload)
     for private_fragment in ("/home/", "/Users/", "mount", "path", "argv", "command", "env", "token"):
@@ -93,13 +94,21 @@ def test_system_health_payload_partial_and_unavailable_are_graceful(monkeypatch)
     assert {e["metric"] for e in partial["errors"]} == {"cpu", "memory"}
     assert "/home/user" not in repr(partial)
 
+    # Now fail everything including net → unavailable
     monkeypatch.setattr(system_health, "_disk_usage", boom)
+    monkeypatch.setattr(
+        system_health,
+        "_net_snapshot",
+        lambda: (_ for _ in ()).throw(RuntimeError("private /home/user/path should not leak")),
+    )
+
     unavailable = system_health.build_system_health_payload()
     assert unavailable["status"] == "unavailable"
     assert unavailable["available"] is False
     assert unavailable["cpu"] is None
     assert unavailable["memory"] is None
     assert unavailable["disk"] is None
+    assert unavailable["net"] is None
     assert "/home/user" not in repr(unavailable)
 
 
@@ -250,6 +259,7 @@ def test_system_health_route_returns_only_sanitized_payload(monkeypatch):
             "cpu": {"percent": 12.0},
             "memory": {"used_bytes": 1, "total_bytes": 2, "percent": 50.0},
             "disk": {"used_bytes": 3, "total_bytes": 4, "percent": 75.0},
+            "net": {"percent": 0.0},
             "errors": [],
         },
     )
@@ -257,7 +267,7 @@ def test_system_health_route_returns_only_sanitized_payload(monkeypatch):
     assert routes.handle_get(handler, urlparse("http://example.test/api/system/health")) is True
     payload = handler.json_body()
     assert payload["cpu"]["percent"] == 12.0
-    assert set(payload) == {"status", "available", "checked_at", "cpu", "memory", "disk", "errors"}
+    assert set(payload) == {"status", "available", "checked_at", "cpu", "memory", "disk", "net", "errors"}
 
 
 def test_system_health_panel_markup_and_styles_live_under_insights_not_top_chrome():
@@ -302,3 +312,95 @@ def test_system_health_backend_uses_no_shell_or_private_process_sources():
     assert "/proc/self/environ" not in src
     for private_field in ("argv", "cmdline", "username", "mountpoint"):
         assert private_field not in src
+
+
+def test_net_snapshot_first_call_returns_zero_baseline(monkeypatch):
+    """First call to _net_snapshot must return (0, 0, 0) and establish baseline."""
+    from api import system_health
+
+    # Reset global state
+    monkeypatch.setattr(system_health, "_NET_PREV", None)
+    monkeypatch.setattr(system_health, "_NET_PREV_TIME", 0.0)
+
+    result = system_health._net_snapshot()
+    assert result == (0.0, 0.0, 0.0)
+
+
+def test_net_snapshot_concurrent_calls_do_not_corrupt_baseline(monkeypatch):
+    """Concurrent _net_snapshot calls must not corrupt the global baseline."""
+    import threading
+    from api import system_health
+
+    # Reset global state
+    monkeypatch.setattr(system_health, "_NET_PREV", None)
+    monkeypatch.setattr(system_health, "_NET_PREV_TIME", 0.0)
+
+    results = []
+    errors = []
+
+    def call_snapshot():
+        try:
+            r = system_health._net_snapshot()
+            results.append(r)
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=call_snapshot) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    assert len(results) == 10
+    # All should be (0, 0, 0) since there's no time delta
+    assert all(r == (0.0, 0.0, 0.0) for r in results)
+
+
+def test_net_snapshot_falls_back_to_psutil_on_non_linux(monkeypatch):
+    """When /proc/net/dev is unavailable, _net_snapshot uses psutil."""
+    from api import system_health
+
+    # Reset global state
+    monkeypatch.setattr(system_health, "_NET_PREV", None)
+    monkeypatch.setattr(system_health, "_NET_PREV_TIME", 0.0)
+
+    # Mock /proc/net/dev to return empty (non-Linux)
+    monkeypatch.setattr(system_health, "_read_proc_net_dev", lambda: {})
+
+    # Mock psutil
+    fake_psutil = SimpleNamespace(
+        net_io_counters=lambda: SimpleNamespace(bytes_recv=1000, bytes_sent=500),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    result = system_health._net_snapshot()
+    # First call with psutil returns (0, 0, 0) to establish baseline
+    assert result == (0.0, 0.0, 0.0)
+
+
+def test_disk_io_first_call_returns_empty(monkeypatch):
+    """First call to _disk_io must return empty dict and establish baseline."""
+    from api import system_health
+
+    # Reset global state
+    monkeypatch.setattr(system_health, "_DISK_PREV", None)
+    monkeypatch.setattr(system_health, "_DISK_PREV_TIME", 0.0)
+
+    result = system_health._disk_io()
+    assert result == {}
+
+
+def test_disk_io_returns_empty_on_non_linux(monkeypatch):
+    """When /proc/diskstats is unavailable, _disk_io returns empty dict."""
+    from api import system_health
+
+    # Reset global state
+    monkeypatch.setattr(system_health, "_DISK_PREV", None)
+    monkeypatch.setattr(system_health, "_DISK_PREV_TIME", 0.0)
+
+    # Mock /proc/diskstats to return empty (non-Linux)
+    monkeypatch.setattr(system_health, "_read_diskstats", lambda: {})
+
+    result = system_health._disk_io()
+    assert result == {}

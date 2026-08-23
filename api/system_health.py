@@ -10,6 +10,7 @@ leave the server.
 from __future__ import annotations
 
 import shutil
+import threading
 import time
 from importlib import import_module
 from datetime import datetime, timezone
@@ -159,113 +160,172 @@ def _safe_error(metric: str, exc: Exception) -> dict[str, str]:
     return {"metric": metric, "code": type(exc).__name__}
 
 
-_NET_PREV_RX: float | None = None
-_NET_PREV_TX: float | None = None
-_NET_PREV_TIME: float = 0.0
 _NET_MAX_BYTES_PER_SEC = 125_000_000  # ~1 Gbps reference for percent clamp
+_NET_LOCK = threading.Lock()
+_NET_PREV: dict[str, int] | None = None
+_NET_PREV_TIME: float = 0.0
 
 
-def _net_percent() -> float:
-    """Estimate network utilization as % of 1 Gbps based on byte delta."""
-    rx, tx = _read_net_speed()
-    total = rx + tx
-    return _clamp_percent((total / _NET_MAX_BYTES_PER_SEC) * 100.0)
+def _read_proc_net_dev() -> dict[str, int]:
+    """Return {iface: total_bytes} from /proc/net/dev. Empty on non-Linux."""
+    stats: dict[str, int] = {}
+    try:
+        with open("/proc/net/dev", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if ":" not in line:
+                    continue
+                iface, _, rest = line.partition(":")
+                iface = iface.strip()
+                if iface == "lo":
+                    continue
+                parts = rest.split()
+                if len(parts) < 9:
+                    continue
+                stats[iface] = int(parts[0]) + int(parts[8])
+    except (OSError, ValueError):
+        pass
+    return stats
 
 
-def _read_net_speed() -> tuple[float, float]:
-    """Return (rx_bytes_per_sec, tx_bytes_per_sec) across non-loopback interfaces."""
-    global _NET_PREV_RX, _NET_PREV_TX, _NET_PREV_TIME
+def _net_snapshot() -> tuple[float, float, float]:
+    """Return (rx_bytes_per_sec, tx_bytes_per_sec, percent) with procfs or psutil fallback.
+
+    Uses a lock to prevent concurrent requests from corrupting the global baseline.
+    """
+    global _NET_PREV, _NET_PREV_TIME
     now = time.time()
-    rx_total = 0
-    tx_total = 0
-    with open("/proc/net/dev", "r", encoding="utf-8") as handle:
-        for line in handle:
-            if ":" not in line:
-                continue
-            iface, _, rest = line.partition(":")
-            iface = iface.strip()
-            if iface == "lo":
-                continue
-            parts = rest.split()
-            if len(parts) < 9:  # need rx bytes at [0] and tx bytes at [8]
-                continue
-            rx_total += int(parts[0])
-            tx_total += int(parts[8])
-    if _NET_PREV_RX is None or now - _NET_PREV_TIME < 0.1:
-        _NET_PREV_RX = rx_total
-        _NET_PREV_TX = tx_total
+
+    with _NET_LOCK:
+        current = _read_proc_net_dev()
+
+        if not current:
+            # No procfs data (macOS, containers without /proc) — try psutil
+            try:
+                psutil = _load_optional_psutil()
+                io = psutil.net_io_counters()
+                total = int(io.bytes_recv) + int(io.bytes_sent)
+            except Exception:
+                return (0.0, 0.0, 0.0)
+
+            if _NET_PREV is None or now - _NET_PREV_TIME < 0.1:
+                _NET_PREV = {"_psutil_total": total}
+                _NET_PREV_TIME = now
+                return (0.0, 0.0, 0.0)
+
+            elapsed = now - _NET_PREV_TIME
+            if elapsed <= 0:
+                return (0.0, 0.0, 0.0)
+            prev_total = _NET_PREV.get("_psutil_total", 0)
+            total_delta = max(0, total - prev_total)
+            _NET_PREV = {"_psutil_total": total}
+            _NET_PREV_TIME = now
+            percent = _clamp_percent((total_delta / elapsed / _NET_MAX_BYTES_PER_SEC) * 100.0)
+            return (0.0, 0.0, percent)
+
+        # Linux procfs path
+        rx_total = sum(int(v) for v in current.values())
+        tx_total = 0
+
+        if _NET_PREV is None or now - _NET_PREV_TIME < 0.1:
+            _NET_PREV = current
+            _NET_PREV_TIME = now
+            return (0.0, 0.0, 0.0)
+
+        elapsed = now - _NET_PREV_TIME
+        if elapsed <= 0:
+            return (0.0, 0.0, 0.0)
+
+        prev_total = sum(int(v) for v in _NET_PREV.values())
+        total_delta = max(0, rx_total - prev_total)
+
+        _NET_PREV = current
         _NET_PREV_TIME = now
-        return (0, 0)
-    elapsed = now - _NET_PREV_TIME
-    if elapsed <= 0 or _NET_PREV_RX is None or _NET_PREV_TX is None:
-        return (0, 0)
-    rx_delta = max(0, rx_total - _NET_PREV_RX)
-    tx_delta = max(0, tx_total - _NET_PREV_TX)
-    _NET_PREV_RX = rx_total
-    _NET_PREV_TX = tx_total
-    _NET_PREV_TIME = now
-    return (rx_delta / elapsed, tx_delta / elapsed)
+
+        rx_per_sec = total_delta / elapsed
+        percent = _clamp_percent((rx_per_sec / _NET_MAX_BYTES_PER_SEC) * 100.0)
+        return (rx_per_sec, 0.0, percent)
 
 
+_DISK_LOCK = threading.Lock()
 _DISK_PREV: dict[str, int] | None = None
 _DISK_PREV_TIME: float = 0.0
 
 
 def _read_diskstats() -> dict[str, int]:
-    """Return {device: sectors_read+written} from /proc/diskstats."""
-    disks = {}
-    with open("/proc/diskstats", "r", encoding="utf-8") as handle:
-        for line in handle:
-            parts = line.split()
-            if len(parts) < 14:
-                continue
-            name = parts[2]
-            # Skip partitions (only show whole disks)
-            if name.startswith("loop") or name.startswith("sr"):
-                continue
-            # sectors read = parts[5], sectors written = parts[9]
-            sectors = int(parts[5]) + int(parts[9])
-            disks[name] = sectors
+    """Return {device: sectors_read+written} from /proc/diskstats. Empty on non-Linux."""
+    disks: dict[str, int] = {}
+    try:
+        with open("/proc/diskstats", "r", encoding="utf-8") as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) < 14:
+                    continue
+                name = parts[2]
+                # Skip partitions (only show whole disks)
+                if name.startswith("loop") or name.startswith("sr"):
+                    continue
+                # sectors read = parts[5], sectors written = parts[9]
+                sectors = int(parts[5]) + int(parts[9])
+                disks[name] = sectors
+    except (OSError, ValueError):
+        pass
     return disks
 
 
 def _disk_io() -> dict[str, int]:
-    """Return {device: bytes_per_sec} for disk IO."""
+    """Return {device: bytes_per_sec} for disk IO. Empty on non-Linux or first call."""
     global _DISK_PREV, _DISK_PREV_TIME
     now = time.time()
-    current = _read_diskstats()
-    if _DISK_PREV is None or now - _DISK_PREV_TIME < 0.1:
+
+    with _DISK_LOCK:
+        current = _read_diskstats()
+
+        if not current:
+            # No procfs data (macOS, containers without /proc)
+            return {}
+
+        if _DISK_PREV is None or now - _DISK_PREV_TIME < 0.1:
+            _DISK_PREV = current
+            _DISK_PREV_TIME = now
+            return {}
+        elapsed = now - _DISK_PREV_TIME
+        if elapsed <= 0:
+            return {}
+        result = {}
+        for name, sectors in current.items():
+            if name in _DISK_PREV:
+                delta = max(0, sectors - _DISK_PREV[name])
+                # sectors are 512 bytes each
+                result[name] = int((delta * 512) / elapsed)
         _DISK_PREV = current
         _DISK_PREV_TIME = now
-        return {}
-    elapsed = now - _DISK_PREV_TIME
-    if elapsed <= 0:
-        return {}
-    result = {}
-    for name, sectors in current.items():
-        if name in _DISK_PREV:
-            delta = max(0, sectors - _DISK_PREV[name])
-            # sectors are 512 bytes each
-            result[name] = int((delta * 512) / elapsed)
-    _DISK_PREV = current
-    _DISK_PREV_TIME = now
-    return result
+        return result
 
 
 def build_system_health_payload() -> dict[str, Any]:
     metrics: dict[str, Any] = {"cpu": None, "memory": None, "disk": None, "net": None}
     errors: list[dict[str, str]] = []
 
+    # Collect network snapshot ONCE — returns (rx, tx, percent) atomically.
+    # Calling _net_snapshot() twice in sequence would always zero the second
+    # result due to the 0.1s baseline guard.
+    net_rx, net_tx, net_percent = (0.0, 0.0, 0.0)
+    net_ok = False
+    try:
+        net_rx, net_tx, net_percent = _net_snapshot()
+        net_ok = True
+    except Exception as exc:
+        errors.append(_safe_error("net", exc))
+
     collectors = {
         "cpu": _cpu_percent,
         "memory": _memory_usage,
         "disk": _disk_usage,
-        "net": _net_percent,
     }
     for name, collect in collectors.items():
         try:
             value = collect()
-            if name in ("cpu", "net"):
+            if name == "cpu":
                 metrics[name] = {"percent": _clamp_percent(value)}
             else:
                 metrics[name] = {
@@ -276,6 +336,13 @@ def build_system_health_payload() -> dict[str, Any]:
         except Exception as exc:
             errors.append(_safe_error(name, exc))
 
+    # Network metrics from the single snapshot above
+    if net_ok:
+        metrics["net"] = {"percent": _clamp_percent(net_percent)}
+        if net_rx > 0 or net_tx > 0:
+            metrics["net"]["rx_bytes_per_sec"] = net_rx
+            metrics["net"]["tx_bytes_per_sec"] = net_tx
+
     # Additional metrics
     try:
         disk_io = _disk_io()
@@ -285,18 +352,6 @@ def build_system_health_payload() -> dict[str, Any]:
                 metrics["disk"]["io_bytes_per_sec"] = total_io
             else:
                 metrics["disk"] = {"io_bytes_per_sec": total_io}
-    except Exception:
-        pass
-
-    try:
-        net_speed = _read_net_speed()
-        if net_speed:
-            rx, tx = net_speed
-            if metrics["net"]:
-                metrics["net"]["rx_bytes_per_sec"] = rx
-                metrics["net"]["tx_bytes_per_sec"] = tx
-            else:
-                metrics["net"] = {"rx_bytes_per_sec": rx, "tx_bytes_per_sec": tx}
     except Exception:
         pass
 
